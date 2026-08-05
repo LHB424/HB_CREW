@@ -65,6 +65,34 @@ def is_work_scene(filename):
     stem = os.path.splitext(filename)[0].lower()
     return not any(t in IGNORE_SCENE_TOKENS for t in _TOKEN_SPLIT.split(stem))
 
+# --- 1-3. 진행 상태 화면 표기 ---
+# 상태 토큰(Done/In Progress/Not Started/세부 상태)은 색상·집계·진행률 계산이
+# `==`로 비교하는 판정값이자 SAVER가 JSON에 쓰는 계약값이다. **토큰은 바꾸지 않고**
+# 화면에 나가는 문자열만 여기서 만든다. 비교·집계에 이 함수의 결과를 쓰면 안 된다.
+STATUS_NONE_LABEL = "—"
+
+def status_label(status, version=""):
+    """상태 토큰과 버전을 화면 표기로 합친다.
+
+        Done        → PUB(v003)
+        In Progress → WIP(v012)
+        Not Started → —
+        그 외(Layout·Blocking·Spline·Polishing 등 세부 상태) → Spline(v012)
+
+    버전이 없으면 괄호 없이 이름만 반환한다(예: 버전 토큰이 없는 옛 파일).
+    """
+    s = (status or "").strip()
+    ver = (version or "").strip()
+    if not s or s == "Not Started":
+        return STATUS_NONE_LABEL
+    if s == "Done":
+        name = "PUB"
+    elif s == "In Progress":
+        name = "WIP"
+    else:
+        name = s
+    return f"{name}({ver})" if ver else name
+
 # --- 2. 안전한 JSON 저장 (원자적 쓰기) ---
 def safe_json_save(filepath, data):
     """파일 쓰기 중 프로그램이 종료되어도 JSON이 깨지지 않도록 안전하게 저장합니다."""

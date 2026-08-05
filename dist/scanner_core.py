@@ -5,9 +5,40 @@
 CREW 사본을 직접 고치면 두 프로그램의 상태 판정이 조용히 갈라진다 — 반드시 여기서 고칠 것.
 """
 import os
+import re
 import json
 
 from common_utils import logger, is_shot_dir, is_work_scene
+
+# 파일명 끝의 버전 토큰(`..._v012.ma`). 이름 중간에 v가 또 있어도 마지막 것이 버전이다.
+_VERSION_RE = re.compile(r"_v(\d+)", re.IGNORECASE)
+
+
+def latest_version(dir_path, exts, work_only=True):
+    """폴더 안 파일들의 `_v###` 중 가장 큰 값을 'v012' 형태로 반환. 없으면 ''.
+
+    상태(Done/In Progress)와 짝을 이뤄 화면에 'PUB(v003)'처럼 표기하기 위한 값이다.
+    판정에는 쓰지 않는다 — 버전이 없어도 상태는 그대로 나와야 한다.
+    """
+    if not os.path.isdir(dir_path):
+        return ""
+    best = None
+    try:
+        names = os.listdir(dir_path)
+    except Exception:
+        return ""
+    for f in names:
+        if not f.lower().endswith(exts):
+            continue
+        if work_only and not is_work_scene(f):
+            continue
+        found = _VERSION_RE.findall(os.path.splitext(f)[0])
+        if not found:
+            continue
+        num = int(found[-1])
+        if best is None or num > best:
+            best = num
+    return "v%03d" % best if best is not None else ""
 
 
 class ProjectScanner:
@@ -18,36 +49,31 @@ class ProjectScanner:
         self.cached_lighting = None
 
     def check_status(self, task_base_path):
-        wip_scenes = os.path.join(task_base_path, "wip", "maya", "scenes")
-        pub_scenes = os.path.join(task_base_path, "pub", "maya", "scenes")
-        
-        def has_maya_files(path):
-            if not os.path.exists(path): return False
-            # 마야 파일이긴 한데, 셋업/템플릿 씬(setup·base·init 토큰)은 무시한다.
-            for f in os.listdir(path):
-                if f.endswith(('.ma', '.mb')):
-                    if is_work_scene(f):
-                        return True
-            return False
+        return self.check_status_ver(task_base_path)[0]
 
-        if has_maya_files(pub_scenes): return "Done"
-        elif has_maya_files(wip_scenes): return "In Progress"
-        else: return "Not Started"
+    def check_status_ver(self, task_base_path):
+        """마야 기준 (상태, 버전) 튜플. 버전은 **현재 상태 쪽** 폴더의 최신 v###."""
+        return self.check_dcc_status_ver(task_base_path, "maya")
 
     def check_tex_status(self, asset_path):
+        return self.check_tex_status_ver(asset_path)[0]
+
+    def check_tex_status_ver(self, asset_path):
         """텍스쳐는 wip 없이 TEX/textures 에 퍼블리시된다(tex_publisher).
-        이미지 파일이 하나라도 있으면 Done, 없으면 Not Started."""
+        이미지 파일이 하나라도 있으면 Done, 없으면 Not Started.
+        버전은 텍스쳐 파일명(`{에셋}_{파트}_basecolor_v###.png`)의 최대값."""
         tex_dir = os.path.join(asset_path, "TEX", "textures")
         if not os.path.isdir(tex_dir):
-            return "Not Started"
+            return ("Not Started", "")
         exts = ('.png', '.jpg', '.jpeg', '.tga', '.tif', '.tiff', '.exr', '.bmp', '.psd')
         try:
             for f in os.listdir(tex_dir):
                 if f.lower().endswith(exts):
-                    return "Done"
+                    # 텍스쳐는 씬 파일이 아니므로 setup/base/init 필터를 적용하지 않는다.
+                    return ("Done", latest_version(tex_dir, exts, work_only=False))
         except Exception:
             pass
-        return "Not Started"
+        return ("Not Started", "")
 
     def _read_user_field(self, meta_dir, json_name):
         """지정한 json 파일 하나에서 'user' 값을 읽어 반환. 실패 시 '-'."""
@@ -351,6 +377,9 @@ class ProjectScanner:
                 meta_path = os.path.join(meta_assets_dir, category, asset_name)
                 # 폴더를 한 번만 훑어 작업자/마감/완료를 모두 확보 (디스크 I/O 최소화)
                 m = self.scan_asset_meta(meta_path)
+                mdl_stat, mdl_ver = self.check_status_ver(os.path.join(asset_path, "MDL"))
+                rig_stat, rig_ver = self.check_status_ver(os.path.join(asset_path, "RIG"))
+                tex_stat, tex_ver = self.check_tex_status_ver(asset_path)
                 asset_status[asset_name] = {
                     "Category": category,
                     "Worker": m["Worker"],
@@ -365,9 +394,13 @@ class ProjectScanner:
                     "Worker_TEX": m["Worker_TEX"],
                     "Deadline_TEX": m["Deadline_TEX"],
                     "DeadlineDone_TEX": m["DeadlineDone_TEX"],
-                    "MDL": self.check_status(os.path.join(asset_path, "MDL")),
-                    "RIG": self.check_status(os.path.join(asset_path, "RIG")),
-                    "TEX": self.check_tex_status(asset_path)
+                    "MDL": mdl_stat,
+                    "RIG": rig_stat,
+                    "TEX": tex_stat,
+                    # 화면 표기용 버전(판정에는 쓰지 않는다) — 'PUB(v003)'의 v003
+                    "MDL_Ver": mdl_ver,
+                    "RIG_Ver": rig_ver,
+                    "TEX_Ver": tex_ver,
                 }
         return asset_status
 
@@ -400,24 +433,34 @@ class ProjectScanner:
                 if not is_shot_dir(cut_name): continue  # _review_cache 등 예약 폴더 제외
                 meta_path = os.path.join(meta_shots_dir, seq_name, cut_name)
 
+                ani_stat, ani_ver = self.check_status_ver(os.path.join(cut_path, "ANI"))
+
                 shot_status[f"{seq_name} / {cut_name}"] = {
                     # 샷은 ANI 단일 단계이므로 _ANI_ 파일 기준으로 작업자를 읽는다.
                     "Worker": self.get_worker_from_metadata(meta_path, stage="ANI"),
                     "Deadline": scene_deadlines[seq_name],
                     "DeadlineDone": scene_dones[seq_name],
-                    "ani": self.check_status(os.path.join(cut_path, "ANI")),
+                    "ani": ani_stat,
+                    # 세부 상태(Spline 등)가 폴더 판정을 덮어써도 버전은 파일 기준이다.
+                    "ani_Ver": ani_ver,
                     "DetailedStatus": self.get_detailed_shot_status(seq_name, cut_name) # 이 부분 추가!
                 }
         return shot_status
 
     def check_dcc_status(self, task_base_path, dcc):
-        """특정 DCC(maya|blender) 기준으로 wip/pub 폴더를 보고 상태를 판정한다.
+        return self.check_dcc_status_ver(task_base_path, dcc)[0]
+
+    def check_dcc_status_ver(self, task_base_path, dcc):
+        """특정 DCC(maya|blender) 기준으로 wip/pub 폴더를 보고 (상태, 버전)을 판정한다.
 
         경로 규약:
           maya   : {task_base}/{wip|pub}/maya/scenes/*.ma|.mb
           blender: {task_base}/{wip|pub}/blender/scenes/*.blend
         (라이팅 saver 규약과 동일. 마야 라이팅 폴더는 아직 없을 수 있으며,
          그 경우 자연히 'Not Started'로 처리된다.)
+
+        버전은 상태를 결정한 폴더에서만 읽는다. pub이 있으면 pub의 최신 버전이며,
+        그 뒤에 더 올라간 wip 버전은 보지 않는다.
         """
         if dcc == "maya":
             sub, exts = ("maya", (".ma", ".mb"))
@@ -434,9 +477,9 @@ class ProjectScanner:
 
         pub_scenes = os.path.join(task_base_path, "pub", sub, "scenes")
         wip_scenes = os.path.join(task_base_path, "wip", sub, "scenes")
-        if has_files(pub_scenes): return "Done"
-        elif has_files(wip_scenes): return "In Progress"
-        else: return "Not Started"
+        if has_files(pub_scenes): return ("Done", latest_version(pub_scenes, exts))
+        elif has_files(wip_scenes): return ("In Progress", latest_version(wip_scenes, exts))
+        else: return ("Not Started", "")
 
     def scan_lighting(self):
         """라이팅(LGT)을 컷 단위로 스캔한다. 마야/블렌더 상태를 각각 반환.
@@ -473,16 +516,20 @@ class ProjectScanner:
                 lgt_base = os.path.join(cut_path, "LGT")
                 meta_path = os.path.join(meta_shots_dir, seq_name, cut_name)
 
-                maya_stat = self.check_dcc_status(lgt_base, "maya")
-                blender_stat = self.check_dcc_status(lgt_base, "blender")
+                maya_stat, maya_ver = self.check_dcc_status_ver(lgt_base, "maya")
+                blender_stat, blender_ver = self.check_dcc_status_ver(lgt_base, "blender")
 
                 # 종합 상태: 둘 중 하나라도 Done이면 Done, 진행 중이면 In Progress
+                # 종합 버전은 그 상태를 만든 DCC 쪽 버전을 따른다(마야 우선).
                 if "Done" in (maya_stat, blender_stat):
                     overall = "Done"
+                    overall_ver = maya_ver if maya_stat == "Done" else blender_ver
                 elif "In Progress" in (maya_stat, blender_stat):
                     overall = "In Progress"
+                    overall_ver = maya_ver if maya_stat == "In Progress" else blender_ver
                 else:
                     overall = "Not Started"
+                    overall_ver = ""
 
                 lgt_status[f"{seq_name} / {cut_name}"] = {
                     "Worker": self.get_worker_from_metadata(meta_path, stage="LGT"),
@@ -490,6 +537,9 @@ class ProjectScanner:
                     "DeadlineDone": scene_dones[seq_name],
                     "Maya": maya_stat,
                     "Blender": blender_stat,
+                    "Maya_Ver": maya_ver,
+                    "Blender_Ver": blender_ver,
                     "DetailedStatus": overall,
+                    "Ver": overall_ver,
                 }
         return lgt_status

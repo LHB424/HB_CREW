@@ -14,7 +14,7 @@ import json
 
 from PySide6 import QtWidgets, QtCore, QtGui
 
-from common_utils import safe_json_save, logger, user_config_path
+from common_utils import safe_json_save, logger, user_config_path, status_label
 from scanner_core import ProjectScanner
 
 # CREW 는 처음부터 사용자 프로필 아래에 쓴다(이관해 올 옛 파일이 없다).
@@ -102,6 +102,7 @@ def collect_my_tasks(assets, shots, lighting, my_name):
                 "name": asset_name,
                 "stage": stage,
                 "status": info.get(stage, "Not Started"),
+                "ver": info.get(f"{stage}_Ver", ""),
                 "deadline": info.get(f"Deadline_{stage}", "") or info.get("Deadline", ""),
                 "done": bool(info.get(f"DeadlineDone_{stage}", info.get("DeadlineDone", False))),
                 "detail": "",
@@ -119,6 +120,7 @@ def collect_my_tasks(assets, shots, lighting, my_name):
             "name": shot_key,
             "stage": "ANI",
             "status": info.get("DetailedStatus") or info.get("ani", "Not Started"),
+            "ver": info.get("ani_Ver", ""),
             "deadline": info.get("Deadline", ""),
             "done": bool(info.get("DeadlineDone", False)),
             "detail": "",
@@ -136,9 +138,12 @@ def collect_my_tasks(assets, shots, lighting, my_name):
             "name": shot_key,
             "stage": "LGT",
             "status": info.get("DetailedStatus", "Not Started"),
+            "ver": info.get("Ver", ""),
             "deadline": info.get("Deadline", ""),
             "done": bool(info.get("DeadlineDone", False)),
-            "detail": f"마야 {info.get('Maya', '-')} / 블렌더 {info.get('Blender', '-')}",
+            "detail": "마야 {} / 블렌더 {}".format(
+                status_label(info.get("Maya", ""), info.get("Maya_Ver", "")),
+                status_label(info.get("Blender", ""), info.get("Blender_Ver", ""))),
         })
 
     return rows
@@ -369,7 +374,8 @@ class CrewWindow(QtWidgets.QWidget):
                 row["kind"],
                 row["name"],
                 row["stage"],
-                row["status"],
+                # 표시는 PUB(v003)/WIP(v012). 필터·정렬은 row["status"] 토큰으로 한다.
+                status_label(row["status"], row.get("ver", "")),
                 row["deadline"] or "-",
             ])
             tip = row["group"]

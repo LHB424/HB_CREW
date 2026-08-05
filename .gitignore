@@ -1,0 +1,17 @@
+# ── Python ──────────────────────────────────────────
+__pycache__/
+*.pyc
+
+# ── 빌드 산출물 (PyInstaller) — 소스 아님, 재생성됨 ──
+/build/
+# 빌드된 실행 파일 (48MB) — hb_pd와 같은 방침
+/dist/crew_launcher.exe
+
+# ── 로그 / 런타임 상태 (자동 생성) ──────────────────
+*.log
+deploy_log.txt
+crew_error_log.txt
+crew_fault.txt
+
+# ── Windows ─────────────────────────────────────────
+desktop.ini

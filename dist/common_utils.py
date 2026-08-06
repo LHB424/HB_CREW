@@ -65,6 +65,45 @@ def is_work_scene(filename):
     stem = os.path.splitext(filename)[0].lower()
     return not any(t in IGNORE_SCENE_TOKENS for t in _TOKEN_SPLIT.split(stem))
 
+# --- 1-2-1. 버전 메타 JSON 판정 ---
+# 메타 폴더에는 성격이 다른 JSON이 섞여 있다.
+#   버전 기록  `{SC}_{C}_ANI_pub_v003.json`  ← SAVER가 저장할 때 만든다(상태·작업자)
+#   배정 기록  `assignment.json`             ← PD가 담당자·마감을 지정할 때 만든다
+#   임시 파일  `tmpXXXX.json`                ← safe_json_save 가 쓰는 동안만 존재
+# "가장 최근 파일"만 보고 상태를 읽거나 쓰면 배정 기록·임시 파일이 걸린다.
+# 상태(status)의 주인은 버전 기록 하나뿐이다.
+_VERSION_META_RE = re.compile(r"_v\d+\.json$", re.IGNORECASE)
+
+def is_version_meta(filename, stage=None):
+    """파일 이름이 버전 기록 JSON인지 여부. stage를 주면 그 단계('_ANI_' 등)로 한정한다."""
+    if not _VERSION_META_RE.search(filename):
+        return False
+    return f"_{stage}_".lower() in filename.lower() if stage else True
+
+def latest_version_meta(meta_dir, stage=None):
+    """메타 폴더에서 **가장 최근에 저장된 버전 기록 JSON**의 전체 경로. 없으면 None.
+
+    mtime 조회는 파일마다 개별로 감싼다 — 목록을 만든 뒤 조회하기까지의 사이에
+    파일이 사라질 수 있고(임시 파일·동기화 중인 클라우드 폴더), 정렬 키에서
+    예외가 나면 호출한 쪽의 스캔 전체가 무효가 된다.
+    """
+    latest_path, latest_mtime = None, -1.0
+    try:
+        names = os.listdir(meta_dir)
+    except OSError:
+        return None
+    for name in names:
+        if not is_version_meta(name, stage):
+            continue
+        path = os.path.join(meta_dir, name)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if mtime > latest_mtime:
+            latest_path, latest_mtime = path, mtime
+    return latest_path
+
 # --- 1-3. 진행 상태 화면 표기 ---
 # 상태 토큰(Done/In Progress/Not Started/세부 상태)은 색상·집계·진행률 계산이
 # `==`로 비교하는 판정값이자 SAVER가 JSON에 쓰는 계약값이다. **토큰은 바꾸지 않고**

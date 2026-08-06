@@ -8,7 +8,7 @@ import os
 import re
 import json
 
-from common_utils import logger, is_shot_dir, is_work_scene
+from common_utils import logger, is_shot_dir, is_work_scene, is_version_meta, latest_version_meta
 
 # 파일명 끝의 버전 토큰(`..._v012.ma`). 이름 중간에 v가 또 있어도 마지막 것이 버전이다.
 _VERSION_RE = re.compile(r"_v(\d+)", re.IGNORECASE)
@@ -176,8 +176,9 @@ class ProjectScanner:
 
         # 디렉터리 목록 1회
         all_files = list_names(meta_dir)
-        json_files = sorted(f for f in all_files
-                            if f.endswith('.json') and f != "assignment.json")
+        # 버전 기록만 남긴다 — 배정 파일과, 저장 중 잠깐 생기는 임시 파일을 뺀다.
+        # (임시 파일은 이름이 tmp… 라 정렬에서 마지막에 와, 대표값 폴백을 가로챈다)
+        json_files = sorted(f for f in all_files if is_version_meta(f))
 
         # 열어본 파일 캐시 (같은 파일 중복 오픈 방지)
         cache = {}
@@ -323,12 +324,9 @@ class ProjectScanner:
     def get_deadline_from_metadata(self, meta_dir):
         """JSON 메타데이터에서 개별 마감일(주로 에셋)을 읽어오는 메서드"""
         if not os.path.exists(meta_dir): return ""
-        json_files = [f for f in os.listdir(meta_dir)
-                      if f.endswith('.json') and f != "assignment.json"]
-        if not json_files: return ""
-        json_files.sort(key=lambda x: os.path.getmtime(os.path.join(meta_dir, x)))
-        latest_json = os.path.join(meta_dir, json_files[-1])
-        try: 
+        latest_json = latest_version_meta(meta_dir)
+        if not latest_json: return ""
+        try:
             with open(latest_json, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 return data.get("deadline", "")
@@ -389,11 +387,10 @@ class ProjectScanner:
         else: actual_status = "Not Started"
 
         meta_dir = os.path.join(self.project_path, "_metadata", "shots", scene, cut)
-        json_files = [f for f in list_names(meta_dir) if f.endswith('.json')]
-        if not json_files: return actual_status
-        
-        json_files.sort(key=lambda x: os.path.getmtime(os.path.join(meta_dir, x)))
-        latest_json = os.path.join(meta_dir, json_files[-1])
+        # 상태(status)는 버전 기록 JSON에만 있다. 같은 폴더의 assignment.json이나
+        # 저장 중 잠깐 생기는 임시 파일이 "최신"으로 뽑히면 세부 상태가 사라진다.
+        latest_json = latest_version_meta(meta_dir, stage="ANI")
+        if not latest_json: return actual_status
         try:
             with open(latest_json, 'r', encoding='utf-8') as f:
                 data = json.load(f)

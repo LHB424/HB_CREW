@@ -14,36 +14,87 @@ from common_utils import logger, is_shot_dir, is_work_scene
 _VERSION_RE = re.compile(r"_v(\d+)", re.IGNORECASE)
 
 
-def latest_version(dir_path, exts, work_only=True):
-    """폴더 안 파일들의 `_v###` 중 가장 큰 값을 'v012' 형태로 반환. 없으면 ''.
+def list_subdirs(dir_path):
+    """폴더 안의 **하위 폴더 이름만** 목록으로 돌려준다(정렬하지 않음).
 
-    상태(Done/In Progress)와 짝을 이뤄 화면에 'PUB(v003)'처럼 표기하기 위한 값이다.
-    판정에는 쓰지 않는다 — 버전이 없어도 상태는 그대로 나와야 한다.
+    `os.listdir` + 이름마다 `os.path.isdir` 을 부르던 자리를 대신한다.
+    Windows에서 디렉터리 열거는 이미 각 항목의 속성을 함께 돌려주므로
+    `entry.is_dir()` 은 추가 조회 없이 답한다 — 항목 수만큼의 왕복이 사라진다.
+    폴더가 없거나 접근할 수 없으면 빈 목록(호출 측의 기존 동작과 같다).
     """
-    if not os.path.isdir(dir_path):
-        return ""
-    best = None
+    try:
+        with os.scandir(dir_path) as it:
+            return [e.name for e in it if e.is_dir()]
+    except Exception:
+        return []
+
+
+def list_names(dir_path):
+    """폴더 안의 이름 목록. 폴더가 없거나 접근 불가면 빈 목록.
+
+    `os.path.exists` 로 미리 확인한 뒤 `os.listdir` 을 부르던 자리를 대신한다.
+    두 번 묻던 것을 한 번으로 줄이며, 확인과 열거 사이에 폴더가 사라지는
+    경합에서도 예외 대신 빈 목록이 된다(판정 결과는 기존과 같다).
+    """
+    try:
+        return os.listdir(dir_path)
+    except Exception:
+        return []
+
+
+def scan_versioned_dir(dir_path, exts, work_only=True):
+    """폴더를 **한 번만** 훑어 (해당 파일이 있는지, 최신 버전 문자열)을 함께 반환한다.
+
+    반환: (bool, "v012") — 파일이 없거나 폴더가 없으면 (False, "").
+    버전 토큰이 없는 파일만 있어도 첫 값은 True다(상태 판정은 버전과 무관).
+
+    상태 판정과 버전 표기가 같은 폴더를 각각 열던 것을 하나로 합친 것이다.
+    폴더 조회 횟수가 절반이 되며, 네트워크/클라우드 드라이브에서 차이가 크다.
+    """
     try:
         names = os.listdir(dir_path)
     except Exception:
-        return ""
+        return (False, "")   # 폴더 없음/접근 불가
+    found_any = False
+    best = None
     for f in names:
         if not f.lower().endswith(exts):
             continue
         if work_only and not is_work_scene(f):
             continue
+        found_any = True
         found = _VERSION_RE.findall(os.path.splitext(f)[0])
         if not found:
             continue
         num = int(found[-1])
         if best is None or num > best:
             best = num
-    return "v%03d" % best if best is not None else ""
+    return (found_any, "v%03d" % best if best is not None else "")
+
+
+def latest_version(dir_path, exts, work_only=True):
+    """폴더 안 파일들의 `_v###` 중 가장 큰 값을 'v012' 형태로 반환. 없으면 ''.
+
+    상태(Done/In Progress)와 짝을 이뤄 화면에 'PUB(v003)'처럼 표기하기 위한 값이다.
+    판정에는 쓰지 않는다 — 버전이 없어도 상태는 그대로 나와야 한다.
+    """
+    return scan_versioned_dir(dir_path, exts, work_only)[1]
 
 
 class ProjectScanner:
     def __init__(self, project_path):
         self.project_path = project_path
+        self.cached_assets = None
+        self.cached_shots = None
+        self.cached_lighting = None
+
+    def clear_cache(self):
+        """스캔 캐시를 모두 비운다 — 새로고침 전에 호출해 실측을 강제한다.
+
+        캐시 필드를 호출하는 쪽에서 하나씩 None으로 되돌리면, 나중에 캐시가
+        늘어났을 때 한쪽(HB PD / HB CREW)만 빠뜨려 옛 데이터가 남는다.
+        비우는 책임은 여기 한 곳에만 둔다.
+        """
         self.cached_assets = None
         self.cached_shots = None
         self.cached_lighting = None
@@ -63,17 +114,10 @@ class ProjectScanner:
         이미지 파일이 하나라도 있으면 Done, 없으면 Not Started.
         버전은 텍스쳐 파일명(`{에셋}_{파트}_basecolor_v###.png`)의 최대값."""
         tex_dir = os.path.join(asset_path, "TEX", "textures")
-        if not os.path.isdir(tex_dir):
-            return ("Not Started", "")
         exts = ('.png', '.jpg', '.jpeg', '.tga', '.tif', '.tiff', '.exr', '.bmp', '.psd')
-        try:
-            for f in os.listdir(tex_dir):
-                if f.lower().endswith(exts):
-                    # 텍스쳐는 씬 파일이 아니므로 setup/base/init 필터를 적용하지 않는다.
-                    return ("Done", latest_version(tex_dir, exts, work_only=False))
-        except Exception:
-            pass
-        return ("Not Started", "")
+        # 텍스쳐는 씬 파일이 아니므로 setup/base/init 필터를 적용하지 않는다.
+        has_tex, ver = scan_versioned_dir(tex_dir, exts, work_only=False)
+        return ("Done", ver) if has_tex else ("Not Started", "")
 
     def _read_user_field(self, meta_dir, json_name):
         """지정한 json 파일 하나에서 'user' 값을 읽어 반환. 실패 시 '-'."""
@@ -122,8 +166,8 @@ class ProjectScanner:
             "Deadline_MDL": "", "Deadline_RIG": "", "Deadline_TEX": "",
             "DeadlineDone_MDL": False, "DeadlineDone_RIG": False, "DeadlineDone_TEX": False,
         }
-        if not os.path.exists(meta_dir):
-            return result
+        # 폴더 존재 여부를 따로 묻지 않는다 — 없으면 아래 두 읽기가 각각
+        # 빈 값을 돌려주고, 결과는 위의 기본값 그대로다(기존과 동일).
 
         # assignment.json 1회 파싱 (작업자 오버라이드 + 마감일/완료 플래그)
         assignment = self._read_assignment(meta_dir)
@@ -131,10 +175,7 @@ class ProjectScanner:
         result["DeadlineDone"] = bool(assignment.get("deadline_done", False))
 
         # 디렉터리 목록 1회
-        try:
-            all_files = os.listdir(meta_dir)
-        except Exception:
-            all_files = []
+        all_files = list_names(meta_dir)
         json_files = sorted(f for f in all_files
                             if f.endswith('.json') and f != "assignment.json")
 
@@ -224,7 +265,8 @@ class ProjectScanner:
         (성능이 중요한 스캔 루프에서는 scan_asset_meta 를 쓰고, 이 메서드는
          다른 탭이 단건으로 물을 때를 위해 유지한다.)
         """
-        if not os.path.exists(meta_dir): return "-"
+        # 폴더 존재 여부는 따로 묻지 않는다 — 폴더가 없으면 assignment.json도
+        # 있을 수 없고, 아래 목록도 비어 "-"로 끝난다(기존 결과와 동일).
 
         # 1) PD 지정(assignment.json) 우선
         assignment = self._read_assignment(meta_dir)
@@ -240,7 +282,7 @@ class ProjectScanner:
                     return override.strip()
 
         # 2) 버전 파일 fallback
-        json_files = [f for f in os.listdir(meta_dir) if f.endswith('.json')]
+        json_files = [f for f in list_names(meta_dir) if f.endswith('.json')]
         json_files = [f for f in json_files if f != "assignment.json"]
         if stage:
             json_files = [f for f in json_files if f"_{stage}_" in f]
@@ -331,13 +373,13 @@ class ProjectScanner:
         wip_dir = os.path.join(self.project_path, "shots", scene, cut, "ANI", "wip", "maya", "scenes")
         pub_dir = os.path.join(self.project_path, "shots", scene, cut, "ANI", "pub", "maya", "scenes")
         
-        has_pub = False
-        if os.path.exists(pub_dir):
-            has_pub = any(f.endswith(('.ma', '.mb')) for f in os.listdir(pub_dir))
-            
+        # pub 판정에는 setup/base/init 필터를 걸지 않는다 —
+        # 버전 표기용 check_dcc_status_ver 와 규칙이 다르므로 합치면 안 된다.
+        has_pub = any(f.endswith(('.ma', '.mb')) for f in list_names(pub_dir))
+
         has_real_wip = False
-        if not has_pub and os.path.exists(wip_dir):
-            for f in os.listdir(wip_dir):
+        if not has_pub:
+            for f in list_names(wip_dir):
                 if f.endswith(('.ma', '.mb')) and is_work_scene(f):
                     has_real_wip = True
                     break
@@ -347,8 +389,7 @@ class ProjectScanner:
         else: actual_status = "Not Started"
 
         meta_dir = os.path.join(self.project_path, "_metadata", "shots", scene, cut)
-        if not os.path.exists(meta_dir): return actual_status
-        json_files = [f for f in os.listdir(meta_dir) if f.endswith('.json')]
+        json_files = [f for f in list_names(meta_dir) if f.endswith('.json')]
         if not json_files: return actual_status
         
         json_files.sort(key=lambda x: os.path.getmtime(os.path.join(meta_dir, x)))
@@ -370,10 +411,9 @@ class ProjectScanner:
         if not os.path.exists(assets_dir): return asset_status
         for category in ["Character", "Env", "Prop"]:
             cat_path = os.path.join(assets_dir, category)
-            if not os.path.exists(cat_path): continue
-            for asset_name in os.listdir(cat_path):
+            # 카테고리 폴더가 없으면 빈 목록이 되어 자연히 건너뛴다.
+            for asset_name in list_subdirs(cat_path):
                 asset_path = os.path.join(cat_path, asset_name)
-                if not os.path.isdir(asset_path): continue
                 meta_path = os.path.join(meta_assets_dir, category, asset_name)
                 # 폴더를 한 번만 훑어 작업자/마감/완료를 모두 확보 (디스크 I/O 최소화)
                 m = self.scan_asset_meta(meta_path)
@@ -402,6 +442,7 @@ class ProjectScanner:
                     "RIG_Ver": rig_ver,
                     "TEX_Ver": tex_ver,
                 }
+        self.cached_assets = asset_status
         return asset_status
 
     def scan_shots(self):
@@ -417,9 +458,8 @@ class ProjectScanner:
         scene_deadlines = {}
         scene_dones = {}
 
-        for seq_name in sorted(os.listdir(shots_dir)):
+        for seq_name in sorted(list_subdirs(shots_dir)):
             seq_path = os.path.join(shots_dir, seq_name)
-            if not os.path.isdir(seq_path): continue
             if not is_shot_dir(seq_name): continue  # 예약 폴더 제외
             
             if seq_name not in scene_deadlines:
@@ -427,9 +467,8 @@ class ProjectScanner:
                 scene_deadlines[seq_name] = dl
                 scene_dones[seq_name] = done
 
-            for cut_name in sorted(os.listdir(seq_path)):
+            for cut_name in sorted(list_subdirs(seq_path)):
                 cut_path = os.path.join(seq_path, cut_name)
-                if not os.path.isdir(cut_path): continue
                 if not is_shot_dir(cut_name): continue  # _review_cache 등 예약 폴더 제외
                 meta_path = os.path.join(meta_shots_dir, seq_name, cut_name)
 
@@ -445,6 +484,7 @@ class ProjectScanner:
                     "ani_Ver": ani_ver,
                     "DetailedStatus": self.get_detailed_shot_status(seq_name, cut_name) # 이 부분 추가!
                 }
+        self.cached_shots = shot_status
         return shot_status
 
     def check_dcc_status(self, task_base_path, dcc):
@@ -467,19 +507,17 @@ class ProjectScanner:
         else:
             sub, exts = ("blender", (".blend",))
 
-        def has_files(path):
-            if not os.path.exists(path): return False
-            for f in os.listdir(path):
-                if f.lower().endswith(exts):
-                    if is_work_scene(f):
-                        return True
-            return False
-
+        # pub이 있으면 wip 폴더는 아예 열지 않는다(기존 판정 순서 그대로).
         pub_scenes = os.path.join(task_base_path, "pub", sub, "scenes")
+        has_pub, pub_ver = scan_versioned_dir(pub_scenes, exts)
+        if has_pub:
+            return ("Done", pub_ver)
+
         wip_scenes = os.path.join(task_base_path, "wip", sub, "scenes")
-        if has_files(pub_scenes): return ("Done", latest_version(pub_scenes, exts))
-        elif has_files(wip_scenes): return ("In Progress", latest_version(wip_scenes, exts))
-        else: return ("Not Started", "")
+        has_wip, wip_ver = scan_versioned_dir(wip_scenes, exts)
+        if has_wip:
+            return ("In Progress", wip_ver)
+        return ("Not Started", "")
 
     def scan_lighting(self):
         """라이팅(LGT)을 컷 단위로 스캔한다. 마야/블렌더 상태를 각각 반환.
@@ -499,9 +537,8 @@ class ProjectScanner:
         scene_deadlines = {}
         scene_dones = {}
 
-        for seq_name in sorted(os.listdir(shots_dir)):
+        for seq_name in sorted(list_subdirs(shots_dir)):
             seq_path = os.path.join(shots_dir, seq_name)
-            if not os.path.isdir(seq_path): continue
             if not is_shot_dir(seq_name): continue  # 예약 폴더 제외
 
             if seq_name not in scene_deadlines:
@@ -509,9 +546,8 @@ class ProjectScanner:
                 scene_deadlines[seq_name] = dl
                 scene_dones[seq_name] = done
 
-            for cut_name in sorted(os.listdir(seq_path)):
+            for cut_name in sorted(list_subdirs(seq_path)):
                 cut_path = os.path.join(seq_path, cut_name)
-                if not os.path.isdir(cut_path): continue
                 if not is_shot_dir(cut_name): continue  # _review_cache 등 예약 폴더 제외
                 lgt_base = os.path.join(cut_path, "LGT")
                 meta_path = os.path.join(meta_shots_dir, seq_name, cut_name)
@@ -542,4 +578,5 @@ class ProjectScanner:
                     "DetailedStatus": overall,
                     "Ver": overall_ver,
                 }
+        self.cached_lighting = lgt_status
         return lgt_status

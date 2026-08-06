@@ -3,7 +3,6 @@ import re
 import json
 import shutil
 import logging
-import tempfile
 from PySide6 import QtWidgets, QtCore, QtGui
 
 # --- 1. 로깅 기본 설정 ---
@@ -14,6 +13,9 @@ logger = logging.getLogger("HBPD")
 # 설정을 exe 옆에 두면 팀 공유 폴더에서 실행할 때 팀원끼리 서로 덮어쓴다.
 # HB 계열 앱(PD·CREW·Texture Publisher)은 모두 이 규칙으로 사용자 프로필 아래에 쓴다.
 CONFIG_VENDOR = "HB_pipeline"
+
+# 저장 직전 내용을 남겨두는 사본의 꼬리표 (safe_json_save / load_json 이 함께 쓴다)
+BACKUP_SUFFIX = ".bak"
 
 def user_config_path(app_key, filename, legacy_path=None):
     """사용자별 설정 파일의 전체 경로를 돌려준다(상위 폴더를 만들어 둔다).
@@ -134,16 +136,67 @@ def status_label(status, version=""):
 
 # --- 2. 안전한 JSON 저장 (원자적 쓰기) ---
 def safe_json_save(filepath, data):
-    """파일 쓰기 중 프로그램이 종료되어도 JSON이 깨지지 않도록 안전하게 저장합니다."""
+    """JSON을 **제자리에** 덮어쓰고, 직전 내용을 `.bak`으로 남긴다.
+
+    예전에는 임시 파일에 쓴 뒤 `os.replace`로 갈아끼웠다(원자적 교체). 로컬
+    디스크에선 가장 안전한 방식이지만, **클라우드 동기화 폴더에서는 사본이
+    증식한다.** 드라이브는 파일을 이름이 아니라 내부 ID로 식별하므로, 갈아끼운
+    파일은 "같은 파일의 새 버전"이 아니라 **새 파일**로 업로드된다. 이름이
+    같은 파일 여러 벌이 허용되니 저장할 때마다 한 벌씩 쌓인다.
+
+    그래서 파일 자체는 제자리에 덮어써 ID를 유지하고(사본 증식 없음), 쓰는
+    도중 중단돼 내용이 깨질 경우를 대비해 직전 내용을 `.bak`에 남긴다.
+    읽는 쪽은 load_json 이 깨진 파일을 만나면 `.bak`으로 되돌아간다.
+
+    `.bak`은 `_v###.json` 형식이 아니므로 버전 기록 판정(is_version_meta)과
+    스캐너 집계에 걸리지 않는다.
+    """
     dir_name = os.path.dirname(filepath)
-    os.makedirs(dir_name, exist_ok=True)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
     try:
-        fd, temp_path = tempfile.mkstemp(dir=dir_name, suffix='.json')
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
-        os.replace(temp_path, filepath)
+        text = json.dumps(data, ensure_ascii=False, indent=4)
+    except Exception as e:
+        logger.error(f"JSON 변환 실패 ({filepath}): {e}")
+        return
+    try:
+        # 직전 내용 백업. 실패해도 저장 자체는 진행한다(백업은 어디까지나 안전망).
+        if os.path.exists(filepath):
+            try:
+                shutil.copyfile(filepath, filepath + BACKUP_SUFFIX)
+            except Exception as e:
+                logger.warning(f"직전 내용 백업 실패 ({filepath}): {e}")
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
     except Exception as e:
         logger.error(f"JSON 저장 실패 ({filepath}): {e}")
+
+
+def load_json(filepath, default=None):
+    """JSON을 읽어 dict로 돌려준다. 본 파일이 깨져 있으면 `.bak`으로 되돌아간다.
+
+    safe_json_save 가 제자리 쓰기를 하므로, 쓰는 도중 중단되면 본 파일이
+    잘린 채 남을 수 있다. 그때 그냥 빈 값을 돌려주면 읽고-고쳐-쓰는 쪽이
+    빈 상태에서 다시 시작해 **배정이 조용히 사라진다.** 그래서 여기서 막는다.
+    """
+    if default is None:
+        default = {}
+    for path, is_backup in ((filepath, False), (filepath + BACKUP_SUFFIX, True)):
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                continue
+            if is_backup:
+                logger.warning(f"본 파일이 깨져 직전 백업을 사용한다: {filepath}")
+            return data
+        except Exception as e:
+            logger.error(f"JSON 읽기 실패 ({path}): {e}")
+    return default
 
 # --- 3. 공통 마감일 위젯 (코드 재사용) ---
 class DeadlineWidget(QtWidgets.QWidget):
@@ -278,15 +331,7 @@ def save_assignment(meta_dir, stage, worker_name):
     """
     os.makedirs(meta_dir, exist_ok=True)
     path = os.path.join(meta_dir, "assignment.json")
-    data = {}
-    if os.path.exists(path):
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    data = loaded
-        except Exception as e:
-            logger.error(f"assignment.json 읽기 실패 ({path}): {e}")
+    data = load_json(path)
 
     name = (worker_name or "").strip()
     if not name or name.startswith("-"):
@@ -302,15 +347,7 @@ def save_json_key(json_path, key, value):
     """지정한 JSON 파일에 key=value를 병합 저장한다(기존 내용 보존).
     value가 None이면 해당 키를 제거한다. 완료 플래그 저장 등에 사용."""
     os.makedirs(os.path.dirname(json_path), exist_ok=True)
-    data = {}
-    if os.path.exists(json_path):
-        try:
-            with open(json_path, 'r', encoding='utf-8') as f:
-                loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    data = loaded
-        except Exception as e:
-            logger.error(f"JSON 읽기 실패 ({json_path}): {e}")
+    data = load_json(json_path)
     if value is None:
         data.pop(key, None)
     else:

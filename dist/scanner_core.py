@@ -134,18 +134,9 @@ class ProjectScanner:
 
     def _read_assignment(self, meta_dir):
         """폴더의 assignment.json(PD가 지정한 단계별 담당자)을 읽어 dict 반환.
-        없거나 읽기 실패 시 빈 dict."""
-        path = os.path.join(meta_dir, "assignment.json")
-        if not os.path.exists(path):
-            return {}
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception as e:
-            from common_utils import logger
-            logger.warning(f"assignment.json 로드 실패 ({path}): {e}")
-            return {}
+        없거나 읽기 실패 시 빈 dict. 본 파일이 깨져 있으면 직전 백업을 쓴다."""
+        from common_utils import load_json
+        return load_json(os.path.join(meta_dir, "assignment.json"))
 
     def scan_asset_meta(self, meta_dir):
         """에셋 메타 폴더를 '한 번만' 훑어 필요한 값을 모두 뽑아 반환한다.

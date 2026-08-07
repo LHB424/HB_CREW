@@ -82,6 +82,93 @@ def is_version_meta(filename, stage=None):
         return False
     return f"_{stage}_".lower() in filename.lower() if stage else True
 
+# --- 1-2-2. 버전 메타의 자리 (단계/종류 폴더 ↔ 옛 평면 구조) ---
+# 생산자 툴은 버전 기록 JSON과 썸네일을 `{메타폴더}/{STAGE}/{wip|pub}/` 아래에 쓴다.
+# 그 전에는 메타 폴더 바로 밑에 전부 쌓았고, 그렇게 만들어진 프로젝트가 이미 있다.
+# **읽는 쪽은 두 자리를 모두 본다** — 옛 프로젝트에서 작업자·상태가 통째로 사라지지
+# 않게 하려는 것이고, 새로 저장한 것만 새 자리에 생긴다.
+# `assignment.json`(배정)·`scene_config.json`(씬 마감)은 예나 지금이나 메타 폴더
+# 바로 밑이다. 주인이 PD 대시보드라 버전과 무관하다.
+STAGE_TOKENS = ("MDL", "RIG", "TEX", "ANI", "LGT")
+META_KINDS = ("wip", "pub")
+
+_META_PLACE_RE = re.compile(r"_(?P<stage>[A-Za-z]+)_(?:(?P<kind>wip|pub)_)?v\d+$",
+                            re.IGNORECASE)
+
+def meta_place_of(base_name):
+    """버전 파일 이름에서 (STAGE, kind)를 뽑는다. 규칙 밖 이름이면 None.
+
+        Father_MDL_pub_v003   → ("MDL", "pub")
+        Father_Body_TEX_v003  → ("TEX", "pub")
+
+    Texture Publisher 의 파일명에는 wip/pub 토큰이 없다 — TEX 는 wip 단계 자체가
+    없어 퍼블리시뿐이므로, 종류가 빠진 이름은 pub 으로 본다.
+    """
+    m = _META_PLACE_RE.search(os.path.splitext(base_name)[0])
+    if not m:
+        return None
+    return m.group("stage").upper(), (m.group("kind") or "pub").lower()
+
+def meta_version_dir(meta_dir, stage, kind):
+    """버전 메타(JSON·썸네일)를 **쓸** 폴더. 생산자 툴과 같은 규약."""
+    return os.path.join(meta_dir, stage, kind)
+
+def meta_file_path(meta_dir, base_name, ext):
+    """씬 이름으로 메타 파일을 **읽을** 때의 경로.
+
+    새 자리에 있으면 그 경로, 없으면 옛 평면 경로를 돌려준다. 둘 다 없을 때도
+    평면 경로를 돌려주므로, 부르는 쪽은 지금처럼 존재 여부만 확인하면 된다.
+    """
+    place = meta_place_of(base_name)
+    if place:
+        path = os.path.join(meta_dir, place[0], place[1], base_name + ext)
+        if os.path.exists(path):
+            return path
+    return os.path.join(meta_dir, base_name + ext)
+
+def _scan_dir_entries(dir_path):
+    """(파일이름들, 폴더이름들). 없거나 못 읽으면 빈 목록 — 스캔을 멈추지 않는다."""
+    files, dirs = [], []
+    try:
+        with os.scandir(dir_path) as it:
+            for entry in it:
+                try:
+                    (dirs if entry.is_dir() else files).append(entry.name)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return files, dirs
+
+def iter_version_metas(meta_dir, stage=None):
+    """메타 폴더의 버전 기록 JSON을 (파일이름, 전체경로)로 모아 돌려준다.
+
+    새 구조(`{STAGE}/{wip|pub}/`)와 옛 평면 구조를 함께 훑는다. stage를 주면
+    그 단계 폴더만 들어간다 — 클라우드 드라이브에서는 폴더 조회 한 번이 비싸므로
+    **실제로 있는 폴더에만** 들어간다.
+    """
+    result = []
+    files, dirs = _scan_dir_entries(meta_dir)
+    for name in files:
+        if is_version_meta(name, stage):
+            result.append((name, os.path.join(meta_dir, name)))
+
+    wanted = {stage.upper()} if stage else set(STAGE_TOKENS)
+    for dname in dirs:
+        if dname.upper() not in wanted:
+            continue
+        stage_dir = os.path.join(meta_dir, dname)
+        _, kind_dirs = _scan_dir_entries(stage_dir)
+        for kname in kind_dirs:
+            if kname.lower() not in META_KINDS:
+                continue
+            kind_dir = os.path.join(stage_dir, kname)
+            kfiles, _ = _scan_dir_entries(kind_dir)
+            for name in kfiles:
+                if is_version_meta(name, stage):
+                    result.append((name, os.path.join(kind_dir, name)))
+    return result
+
 def latest_version_meta(meta_dir, stage=None):
     """메타 폴더에서 **가장 최근에 저장된 버전 기록 JSON**의 전체 경로. 없으면 None.
 
@@ -90,14 +177,7 @@ def latest_version_meta(meta_dir, stage=None):
     예외가 나면 호출한 쪽의 스캔 전체가 무효가 된다.
     """
     latest_path, latest_mtime = None, -1.0
-    try:
-        names = os.listdir(meta_dir)
-    except OSError:
-        return None
-    for name in names:
-        if not is_version_meta(name, stage):
-            continue
-        path = os.path.join(meta_dir, name)
+    for _name, path in iter_version_metas(meta_dir, stage):
         try:
             mtime = os.path.getmtime(path)
         except OSError:

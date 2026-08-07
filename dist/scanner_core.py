@@ -8,7 +8,8 @@ import os
 import re
 import json
 
-from common_utils import logger, is_shot_dir, is_work_scene, is_version_meta, latest_version_meta
+from common_utils import (logger, is_shot_dir, is_work_scene,
+                          latest_version_meta, iter_version_metas)
 
 # 파일명 끝의 버전 토큰(`..._v012.ma`). 이름 중간에 v가 또 있어도 마지막 것이 버전이다.
 _VERSION_RE = re.compile(r"_v(\d+)", re.IGNORECASE)
@@ -119,10 +120,14 @@ class ProjectScanner:
         has_tex, ver = scan_versioned_dir(tex_dir, exts, work_only=False)
         return ("Done", ver) if has_tex else ("Not Started", "")
 
-    def _read_user_field(self, meta_dir, json_name):
-        """지정한 json 파일 하나에서 'user' 값을 읽어 반환. 실패 시 '-'."""
+    def _read_user_field(self, json_path, json_name=""):
+        """지정한 json 파일 하나에서 'user' 값을 읽어 반환. 실패 시 '-'.
+
+        경로를 통째로 받는다 — 버전 메타는 `{STAGE}/{wip|pub}/` 아래에도 있어
+        메타 폴더와 파일 이름만으로는 자리를 알 수 없다."""
+        json_name = json_name or os.path.basename(json_path)
         try:
-            with open(os.path.join(meta_dir, json_name), 'r', encoding='utf-8') as f:
+            with open(json_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 worker_name = data.get("user", "")
                 if worker_name and worker_name.strip():
@@ -165,18 +170,19 @@ class ProjectScanner:
         # 공용 완료(구버전 호환)
         result["DeadlineDone"] = bool(assignment.get("deadline_done", False))
 
-        # 디렉터리 목록 1회
-        all_files = list_names(meta_dir)
         # 버전 기록만 남긴다 — 배정 파일과, 저장 중 잠깐 생기는 임시 파일을 뺀다.
         # (임시 파일은 이름이 tmp… 라 정렬에서 마지막에 와, 대표값 폴백을 가로챈다)
-        json_files = sorted(f for f in all_files if is_version_meta(f))
+        # iter_version_metas 가 새 구조(`{STAGE}/{wip|pub}/`)와 옛 평면 구조를 함께
+        # 훑는다. 같은 이름이 두 자리에 있으면 새 구조 쪽이 남는다.
+        meta_paths = dict(iter_version_metas(meta_dir))     # 파일이름 → 전체경로
+        json_files = sorted(meta_paths)
 
         # 열어본 파일 캐시 (같은 파일 중복 오픈 방지)
         cache = {}
         def load(fname):
             if fname not in cache:
                 try:
-                    with open(os.path.join(meta_dir, fname), 'r', encoding='utf-8') as f:
+                    with open(meta_paths[fname], 'r', encoding='utf-8') as f:
                         d = json.load(f)
                         cache[fname] = d if isinstance(d, dict) else {}
                 except Exception:
@@ -273,14 +279,12 @@ class ProjectScanner:
                 if override and override.strip():
                     return override.strip()
 
-        # 2) 버전 파일 fallback
-        json_files = [f for f in list_names(meta_dir) if f.endswith('.json')]
-        json_files = [f for f in json_files if f != "assignment.json"]
-        if stage:
-            json_files = [f for f in json_files if f"_{stage}_" in f]
-        if not json_files: return "-"
-        json_files.sort()  # zero-pad된 _v### 덕분에 파일명 정렬 = 버전 순
-        return self._read_user_field(meta_dir, json_files[-1])
+        # 2) 버전 파일 fallback (새 구조·옛 평면 구조 모두)
+        metas = iter_version_metas(meta_dir, stage)
+        if not metas: return "-"
+        metas.sort()  # zero-pad된 _v### 덕분에 파일명 정렬 = 버전 순
+        name, path = metas[-1]
+        return self._read_user_field(path, name)
 
     def get_all_member_names(self):
         """project_config.json의 teams(구버전은 members)에서 모든 팀원 이름을 모아

@@ -436,8 +436,74 @@ def save_json_key(json_path, key, value):
     return data
 
 
+# --- 4-1. 휠로 값이 바뀌지 않는 입력 위젯 ---
+# 마우스 휠은 **스크롤 수단이지 값 변경 수단이 아니다.** 표나 폼을 스크롤하다
+# 콤보·스핀 위를 지나가면 값이 조용히 바뀌고, 바뀐 줄도 모른 채 저장된다.
+# 되돌릴 단서도 없다(무엇이 언제 바뀌었는지 화면에 남지 않는다).
+#
+# **수치·선택 입력을 새로 만들 때는 QComboBox/QSpinBox 를 직접 쓰지 말고 여기
+# 것을 쓴다.** 이미 만들어진 위젯이나 여기 없는 종류는 block_wheel() 로 막는다.
+#
+# 두 방식의 차이:
+#   서브클래스 — 휠을 무시(ignore)해 **부모가 대신 스크롤**한다. 표·스크롤
+#                영역 안에 있는 입력에 맞다.
+#   block_wheel — 휠을 삼킨다(부모도 스크롤하지 않는다). 스크롤할 것이 없는
+#                다이얼로그 안의 입력에 맞다.
+
+class _NoWheelMixin:
+    """휠 이벤트를 받지 않는다. 부모(표·스크롤 영역)가 대신 처리한다."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 휠로 포커스가 옮겨가며 값이 바뀌는 경로도 함께 막는다.
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class NoWheelComboBox(_NoWheelMixin, QtWidgets.QComboBox):
+    pass
+
+
+class NoWheelSpinBox(_NoWheelMixin, QtWidgets.QSpinBox):
+    pass
+
+
+class NoWheelDoubleSpinBox(_NoWheelMixin, QtWidgets.QDoubleSpinBox):
+    pass
+
+
+class NoWheelDateEdit(_NoWheelMixin, QtWidgets.QDateEdit):
+    pass
+
+
+class NoWheelSlider(_NoWheelMixin, QtWidgets.QSlider):
+    pass
+
+
+class _WheelBlocker(QtCore.QObject):
+    """설치된 위젯에 오는 휠 이벤트를 삼킨다."""
+
+    def eventFilter(self, obj, event):
+        if event.type() == QtCore.QEvent.Type.Wheel:
+            return True
+        return False
+
+
+def block_wheel(widget):
+    """이미 만들어진 위젯의 휠 값 변경을 막는다. 위젯을 그대로 돌려준다.
+
+    필터를 위젯의 자식으로 만들어 수명을 위젯에 맡긴다 — 지역 변수로 두면
+    함수가 끝나는 순간 회수되어 **필터가 조용히 사라진다.**
+    """
+    widget.installEventFilter(_WheelBlocker(widget))
+    widget.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+    return widget
+
+
 # --- 5. 작업자 배정 드롭다운 위젯 (Assets/Rigging 공용) ---
-class WorkerComboWidget(QtWidgets.QComboBox):
+class WorkerComboWidget(NoWheelComboBox):
     """팀원 명단에서 작업자를 골라 assignment.json에 즉시 저장하는 콤보박스.
 
     member_names : 드롭다운에 채울 팀원 이름 리스트
@@ -451,8 +517,7 @@ class WorkerComboWidget(QtWidgets.QComboBox):
         self.save_callback = save_callback
         self._loading = True   # 초기 채우는 동안 콜백 억제
 
-        # 마우스 휠로 실수로 값이 바뀌지 않도록 포커스 정책 조정
-        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        # 휠로 값이 바뀌지 않는 것은 NoWheelComboBox 가 맡는다.
         self.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
         self.setStyleSheet("""
             QComboBox { background-color: #242429; color: #e8e8ec; border: 1px solid #3a3a42;
@@ -478,11 +543,6 @@ class WorkerComboWidget(QtWidgets.QComboBox):
 
         self._loading = False
         self.currentIndexChanged.connect(self._on_changed)
-
-    def wheelEvent(self, event):
-        # 콤보 위에서 마우스 휠을 돌려도 값이 바뀌지 않도록 무시하고,
-        # 대신 부모(트리 스크롤)로 이벤트를 넘긴다.
-        event.ignore()
 
     def _on_changed(self, _idx):
         if self._loading:

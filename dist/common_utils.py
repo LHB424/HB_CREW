@@ -489,3 +489,185 @@ class WorkerComboWidget(QtWidgets.QComboBox):
             return
         value = self.currentData()
         self.save_callback(value if value is not None else "-")
+
+
+# --- 6. 스토리보드 (아직 작업하지 않은 컷의 미리보기) ---
+# 애니 작업 전 컷은 플레이블라스트가 없어 리뷰 탭에서 볼 것이 없다. 스토리보드
+# 이미지를 컷에 배정해 두면 지정한 프레임 길이만큼 스틸을 대신 보여준다.
+#
+#   이미지 : {PROJ}/storyboard/{SC}/{SC}_{C}_01.jpg   (컷당 여러 장 가능)
+#   프레임 : _metadata/shots/{SC}/{C}/cut_config.json  → {"frames": 50}
+#   fps    : _pipeline/project_config.json 의 "fps" (없으면 24)
+#
+# 이미지를 shots/ 트리 **밖**(프로젝트 루트)에 두는 이유: 컷 스캔 대상 폴더가
+# 아니므로 RESERVED_DIRS를 건드릴 필요가 없고, 스캐너가 컷으로 오인할 여지도 없다.
+# 프레임을 assignment.json에 섞지 않는 이유: 배정 파일에 성격이 다른 키를 섞으면
+# 아티스트 재저장·PD 조작이 서로를 덮는다(같은 계열의 과거 사고).
+STORYBOARD_DIR_NAME = "storyboard"
+STORYBOARD_TRASH_NAME = "_trash"
+STORYBOARD_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+CUT_CONFIG_NAME = "cut_config.json"
+DEFAULT_FPS = 24
+DEFAULT_CUT_FRAMES = 50
+
+
+def storyboard_root(project_path):
+    return os.path.join(project_path, STORYBOARD_DIR_NAME)
+
+
+def storyboard_scene_dir(project_path, scene):
+    return os.path.join(project_path, STORYBOARD_DIR_NAME, scene)
+
+
+def storyboard_trash_dir(project_path):
+    """지운 스토리보드를 옮겨 두는 자리. 영구 삭제는 하지 않는다."""
+    return os.path.join(project_path, STORYBOARD_DIR_NAME, STORYBOARD_TRASH_NAME)
+
+
+def is_storyboard_image(filename):
+    return filename.lower().endswith(STORYBOARD_EXTS)
+
+
+def _storyboard_pattern(scene, cut):
+    """`{SC}_{C}_01` 과 순번 없는 `{SC}_{C}` 를 함께 받는다.
+
+    컷 이름을 정규식에 그대로 넣으면 안 된다(이름에 `.`·`(`가 들어갈 수 있다).
+    이름 전체를 앵커로 묶어 비교하므로 C001이 C0010을 잡는 일이 없다.
+    """
+    return re.compile(r"^%s_%s(?:_(\d+))?$" % (re.escape(scene), re.escape(cut)),
+                      re.IGNORECASE)
+
+
+def storyboard_index(project_path, scene, cuts):
+    """씬 폴더를 **한 번만** 조회해 {컷: [이미지 경로]} 를 만든다.
+
+    컷마다 storyboard_files 를 부르면 같은 폴더를 컷 수만큼 다시 조회한다.
+    클라우드 드라이브에서는 폴더 조회 한 번이 비싸므로, 컷 목록이 있을 때는
+    이쪽을 쓴다(리뷰 탭이 씬 단위로 그리는 경로).
+    """
+    scene_dir = storyboard_scene_dir(project_path, scene)
+    files, _dirs = _scan_dir_entries(scene_dir)
+    images = [n for n in files if is_storyboard_image(n)]
+
+    result = {}
+    for cut in cuts:
+        pattern = _storyboard_pattern(scene, cut)
+        found = []
+        for name in images:
+            m = pattern.match(os.path.splitext(name)[0])
+            if not m:
+                continue
+            idx = int(m.group(1)) if m.group(1) else 0
+            found.append((idx, name.lower(), os.path.join(scene_dir, name)))
+        found.sort()
+        result[cut] = [p for _i, _n, p in found]
+    return result
+
+
+def storyboard_files(project_path, scene, cut):
+    """그 컷에 배정된 스토리보드 이미지 경로를 순번대로. 없으면 []."""
+    return storyboard_index(project_path, scene, [cut])[cut]
+
+
+def storyboard_frame_spans(count, frames):
+    """이미지 count 장을 총 frames 프레임에 균등 분배한다. 나머지는 앞쪽부터.
+
+        (3, 50) -> [17, 17, 16]
+
+    이미지가 프레임보다 많으면 한 장에 1프레임씩 준다 — 0프레임짜리 장면을
+    만들면 그 이미지는 있는데도 화면에 뜨지 않는다.
+    """
+    count = int(count or 0)
+    if count <= 0:
+        return []
+    frames = max(int(frames or 0), count)
+    base, extra = divmod(frames, count)
+    return [base + (1 if i < extra else 0) for i in range(count)]
+
+
+def next_storyboard_index(project_path, scene, cut):
+    """그 컷에 이미지를 **추가**할 때 쓸 다음 순번(1부터)."""
+    pattern = _storyboard_pattern(scene, cut)
+    scene_dir = storyboard_scene_dir(project_path, scene)
+    highest = 0
+    files, _dirs = _scan_dir_entries(scene_dir)
+    for name in files:
+        if not is_storyboard_image(name):
+            continue
+        m = pattern.match(os.path.splitext(name)[0])
+        if m:
+            highest = max(highest, int(m.group(1)) if m.group(1) else 1)
+    return highest + 1
+
+
+def storyboard_target_path(project_path, scene, cut, index, ext):
+    """규약 이름으로 저장할 전체 경로. 원본 파일명은 여기서 버려진다.
+
+    원본 이름을 그대로 두지 않는 것은 매칭을 파일명 하나로 끝내기 위해서이고,
+    덤으로 한글·공백·특수문자가 파이프라인 안으로 들어오지 않는다.
+    """
+    ext = ext if ext.startswith(".") else "." + ext
+    name = f"{scene}_{cut}_{str(index).zfill(2)}{ext.lower()}"
+    return os.path.join(storyboard_scene_dir(project_path, scene), name)
+
+
+# --- 6-1. 컷 프레임 (cut_config.json) ---
+def cut_config_path(project_path, scene, cut):
+    return os.path.join(project_path, "_metadata", "shots", scene, cut, CUT_CONFIG_NAME)
+
+
+def load_cut_frames(project_path, scene, cut, default=None):
+    """컷에 지정된 총 프레임 수. 지정된 적 없으면 default(기본 None)."""
+    data = load_json(cut_config_path(project_path, scene, cut))
+    value = data.get("frames")
+    try:
+        frames = int(value)
+    except (TypeError, ValueError):
+        return default
+    return frames if frames > 0 else default
+
+
+def save_cut_frames(project_path, scene, cut, frames):
+    """컷의 총 프레임 수를 저장한다. frames가 0 이하/None이면 지정을 해제한다."""
+    path = cut_config_path(project_path, scene, cut)
+    try:
+        value = int(frames)
+    except (TypeError, ValueError):
+        value = 0
+    return save_json_key(path, "frames", value if value > 0 else None)
+
+
+def project_fps(project_path):
+    """프로젝트 fps. project_config.json에 없으면 24(마야 film 기준)."""
+    config = load_json(os.path.join(project_path, "_pipeline", "project_config.json"))
+    try:
+        fps = float(config.get("fps"))
+    except (TypeError, ValueError):
+        return DEFAULT_FPS
+    return fps if fps > 0 else DEFAULT_FPS
+
+
+# --- 6-2. 파일 이름에서 컷 추측 (업로드 창의 자동 채움) ---
+def guess_cut_from_filename(filename, cut_keys):
+    """파일 이름에 든 토큰으로 (씬, 컷)을 추측한다. 확실하지 않으면 None.
+
+    cut_keys: [(씬, 컷), ...] — 프로젝트에 실제로 있는 컷 목록.
+
+    토큰 단위로만 비교한다. 부분문자열로 보면 `C001`이 `C0010`을 잡는다.
+    컷 이름이 여러 씬에 겹치는데 파일 이름에 씬이 없으면 **추측하지 않는다** —
+    틀린 자동 배정은 없는 것만 못하다(순서 자동배정을 하지 않는 이유와 같다).
+    """
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    tokens = {t.upper() for t in _TOKEN_SPLIT.split(stem) if t}
+    if not tokens:
+        return None
+
+    matches = [(s, c) for (s, c) in cut_keys if c.upper() in tokens]
+    if not matches:
+        return None
+    with_scene = [(s, c) for (s, c) in matches if s.upper() in tokens]
+    if len(with_scene) == 1:
+        return with_scene[0]
+    if len(matches) == 1:
+        return matches[0]
+    return None

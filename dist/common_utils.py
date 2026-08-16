@@ -9,6 +9,21 @@ from PySide6 import QtWidgets, QtCore, QtGui
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("HBPD")
 
+# 로그 한 줄이 앱을 죽이지 않게 한다.
+# 이 환경의 콘솔은 cp949라 `—`(U+2014) 같은 문자를 인코딩하지 못한다. 기록 문구에
+# 한글이 많아 자연히 섞인다. StreamHandler가 UnicodeEncodeError를 내면 logging은
+# handleError에서 스택을 다시 찍는데 그 출력도 같은 이유로 터져, 예외가 호출부까지
+# 올라간다 — **탭 로드 실패를 기록하려던 로그 한 줄이 대시보드 전체를 못 뜨게 한다**
+# (FailedTab 안전망이 통째로 무력화된다).
+logging.raiseExceptions = False
+for _handler in logging.getLogger().handlers:
+    _stream = getattr(_handler, "stream", None)
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
 # --- 1-0. 사용자별 설정 파일 경로 ---
 # 설정을 exe 옆에 두면 팀 공유 폴더에서 실행할 때 팀원끼리 서로 덮어쓴다.
 # HB 계열 앱(PD·CREW·Texture Publisher)은 모두 이 규칙으로 사용자 프로필 아래에 쓴다.
@@ -192,12 +207,21 @@ def latest_version_meta(meta_dir, stage=None):
 # 화면에 나가는 문자열만 여기서 만든다. 비교·집계에 이 함수의 결과를 쓰면 안 된다.
 STATUS_NONE_LABEL = "—"
 
+# '해당 없음' — 이 에셋/컷에는 **애초에 그 단계가 없다**(리깅하지 않는 소품 등).
+# 'Not Started'(해야 하는데 아직 안 함)와 반드시 구분한다. 섞이면 끝날 수 없는
+# 일이 분모에 남아 진행률이 영원히 100%에 닿지 못한다.
+# 표시 주체는 PD — assignment.json 의 na_stages 목록에 스테이지 토큰을 넣는다.
+STATUS_NA = "N/A"
+STATUS_NA_LABEL = "해당없음"
+NA_STAGES_KEY = "na_stages"
+
 def status_label(status, version=""):
     """상태 토큰과 버전을 화면 표기로 합친다.
 
         Done        → PUB(v003)
         In Progress → WIP(v012)
         Not Started → —
+        N/A         → 해당없음
         그 외(Layout·Blocking·Spline·Polishing 등 세부 상태) → Spline(v012)
 
     버전이 없으면 괄호 없이 이름만 반환한다(예: 버전 토큰이 없는 옛 파일).
@@ -206,6 +230,8 @@ def status_label(status, version=""):
     ver = (version or "").strip()
     if not s or s == "Not Started":
         return STATUS_NONE_LABEL
+    if s == STATUS_NA:
+        return STATUS_NA_LABEL
     if s == "Done":
         name = "PUB"
     elif s == "In Progress":
@@ -423,6 +449,52 @@ def save_assignment(meta_dir, stage, worker_name):
     return data
 
 
+def na_stages_of(assignment):
+    """assignment.json 내용에서 '해당 없음'으로 표시된 단계 집합을 뽑는다.
+
+    assignment: load_json 으로 읽은 dict (파일이 없으면 빈 dict)
+    반환: {"RIG", "TEX"} 같은 대문자 스테이지 토큰 집합. 키가 없으면 빈 집합이라
+          옛 프로젝트는 지금까지와 똑같이 동작한다.
+
+    형식이 깨져 있어도(리스트가 아님 등) 예외 없이 빈 집합을 돌려준다 — 표시용
+    부가 정보 하나 때문에 스캔 전체가 무효가 되면 안 된다.
+    """
+    if not isinstance(assignment, dict):
+        return set()
+    raw = assignment.get(NA_STAGES_KEY)
+    if not isinstance(raw, list):
+        return set()
+    return {str(s).strip().upper() for s in raw if str(s).strip()}
+
+
+def save_stage_na(meta_dir, stage, is_na):
+    """assignment.json 의 na_stages 목록에 단계를 넣거나 뺀다.
+
+    meta_dir: 에셋 `_metadata/assets/{Category}/{에셋}` 또는
+              컷 `_metadata/shots/{씬}/{컷}` 메타 폴더
+    stage   : "RIG" | "TEX" | "LGT" 등 스테이지 토큰
+    is_na   : True면 '해당 없음', False면 해제
+
+    작업 폴더와 씬 파일은 건드리지 않는다 — 표시만 바꾸므로 해제하면 그대로
+    돌아온다. 목록이 비면 키째 지워 파일에 빈 흔적을 남기지 않는다.
+    """
+    stage = (stage or "").strip().upper()
+    path = os.path.join(meta_dir, "assignment.json")
+    data = load_json(path)
+    stages = na_stages_of(data)
+    if is_na:
+        stages.add(stage)
+    else:
+        stages.discard(stage)
+    if stages:
+        data[NA_STAGES_KEY] = sorted(stages)
+    else:
+        data.pop(NA_STAGES_KEY, None)
+    os.makedirs(meta_dir, exist_ok=True)
+    safe_json_save(path, data)
+    return data
+
+
 def save_json_key(json_path, key, value):
     """지정한 JSON 파일에 key=value를 병합 저장한다(기존 내용 보존).
     value가 None이면 해당 키를 제거한다. 완료 플래그 저장 등에 사용."""
@@ -549,6 +621,40 @@ class WorkerComboWidget(NoWheelComboBox):
             return
         value = self.currentData()
         self.save_callback(value if value is not None else "-")
+
+
+class NaCheckWidget(QtWidgets.QWidget):
+    """'이 단계는 해당 없음' 체크 상자 (표 한 칸에 들어가는 가운데 정렬 체크박스).
+
+    리깅하지 않는 소품, 텍스쳐를 쓰지 않는 프록시처럼 **애초에 할 일이 아닌**
+    단계를 표시한다. 켜면 그 단계는 진행률 분모에서 빠지고 화면에 '해당없음'으로
+    나온다. 폴더·파일은 그대로이므로 끄면 원래대로 돌아온다.
+
+    is_na    : 현재 상태
+    callback : 새 상태(bool)를 받아 저장하는 콜백
+    """
+    def __init__(self, is_na, callback):
+        super().__init__()
+        self.callback = callback
+
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.box = QtWidgets.QCheckBox()
+        self.box.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.box.setToolTip("이 단계는 하지 않는 작업입니다 — 진행률 계산에서 빠집니다")
+        # 콜백 연결 전에 초기값을 넣는다 — 화면을 그리는 것만으로 저장이 일어나면
+        # 새로고침 때마다 메타 파일이 다시 쓰인다.
+        self.box.setChecked(bool(is_na))
+        self.box.toggled.connect(self._on_toggled)
+
+        layout.addStretch()
+        layout.addWidget(self.box)
+        layout.addStretch()
+
+    def _on_toggled(self, checked):
+        self.callback(bool(checked))
 
 
 # --- 6. 스토리보드 (아직 작업하지 않은 컷의 미리보기) ---

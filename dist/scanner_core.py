@@ -9,7 +9,8 @@ import re
 import json
 
 from common_utils import (logger, is_shot_dir, is_work_scene,
-                          latest_version_meta, iter_version_metas)
+                          latest_version_meta, iter_version_metas,
+                          na_stages_of, STATUS_NA)
 
 # 파일명 끝의 버전 토큰(`..._v012.ma`). 이름 중간에 v가 또 있어도 마지막 것이 버전이다.
 _VERSION_RE = re.compile(r"_v(\d+)", re.IGNORECASE)
@@ -161,6 +162,7 @@ class ProjectScanner:
             "Deadline": "", "DeadlineDone": False,
             "Deadline_MDL": "", "Deadline_RIG": "", "Deadline_TEX": "",
             "DeadlineDone_MDL": False, "DeadlineDone_RIG": False, "DeadlineDone_TEX": False,
+            "NA_Stages": set(),
         }
         # 폴더 존재 여부를 따로 묻지 않는다 — 없으면 아래 두 읽기가 각각
         # 빈 값을 돌려주고, 결과는 위의 기본값 그대로다(기존과 동일).
@@ -169,6 +171,8 @@ class ProjectScanner:
         assignment = self._read_assignment(meta_dir)
         # 공용 완료(구버전 호환)
         result["DeadlineDone"] = bool(assignment.get("deadline_done", False))
+        # PD가 '해당 없음'으로 표시한 단계(리깅 안 하는 소품 등)
+        result["NA_Stages"] = na_stages_of(assignment)
 
         # 버전 기록만 남긴다 — 배정 파일과, 저장 중 잠깐 생기는 임시 파일을 뺀다.
         # (임시 파일은 이름이 tmp… 라 정렬에서 마지막에 와, 대표값 폴백을 가로챈다)
@@ -412,6 +416,14 @@ class ProjectScanner:
                 mdl_stat, mdl_ver = self.check_status_ver(os.path.join(asset_path, "MDL"))
                 rig_stat, rig_ver = self.check_status_ver(os.path.join(asset_path, "RIG"))
                 tex_stat, tex_ver = self.check_tex_status_ver(asset_path)
+
+                # '해당 없음' 단계는 폴더 판정을 덮어쓴다. 폴더는 그대로 두므로
+                # 표시를 해제하면 원래 상태가 다시 나온다.
+                na = m["NA_Stages"]
+                if "MDL" in na: mdl_stat, mdl_ver = STATUS_NA, ""
+                if "RIG" in na: rig_stat, rig_ver = STATUS_NA, ""
+                if "TEX" in na: tex_stat, tex_ver = STATUS_NA, ""
+
                 asset_status[asset_name] = {
                     "Category": category,
                     "Worker": m["Worker"],
@@ -433,6 +445,8 @@ class ProjectScanner:
                     "MDL_Ver": mdl_ver,
                     "RIG_Ver": rig_ver,
                     "TEX_Ver": tex_ver,
+                    # 화면에서 체크 상태를 되살리기 위한 목록(집계는 위 상태 토큰으로 한다)
+                    "NA_Stages": sorted(na),
                 }
         self.cached_assets = asset_status
         return asset_status
@@ -559,6 +573,13 @@ class ProjectScanner:
                     overall = "Not Started"
                     overall_ver = ""
 
+                # 라이팅을 하지 않는 컷은 PD가 '해당 없음'으로 표시한다.
+                # 두 DCC와 종합 상태를 함께 덮어야 어느 화면에서도 어긋나지 않는다.
+                na = na_stages_of(self._read_assignment(meta_path))
+                if "LGT" in na:
+                    maya_stat = blender_stat = overall = STATUS_NA
+                    maya_ver = blender_ver = overall_ver = ""
+
                 lgt_status[f"{seq_name} / {cut_name}"] = {
                     "Worker": self.get_worker_from_metadata(meta_path, stage="LGT"),
                     "Deadline": scene_deadlines[seq_name],
@@ -569,6 +590,7 @@ class ProjectScanner:
                     "Blender_Ver": blender_ver,
                     "DetailedStatus": overall,
                     "Ver": overall_ver,
+                    "NA_Stages": sorted(na),
                 }
         self.cached_lighting = lgt_status
         return lgt_status

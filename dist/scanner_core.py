@@ -8,9 +8,8 @@ import os
 import re
 import json
 
-from common_utils import (logger, is_shot_dir, is_work_scene,
-                          latest_version_meta, iter_version_metas,
-                          na_stages_of, STATUS_NA)
+from common_utils import (logger, is_shot_dir, is_work_scene, is_version_meta,
+                          iter_version_metas, na_stages_of, STATUS_NA)
 
 # 파일명 끝의 버전 토큰(`..._v012.ma`). 이름 중간에 v가 또 있어도 마지막 것이 버전이다.
 _VERSION_RE = re.compile(r"_v(\d+)", re.IGNORECASE)
@@ -89,6 +88,10 @@ class ProjectScanner:
         self.cached_assets = None
         self.cached_shots = None
         self.cached_lighting = None
+        # 메타 폴더 1개를 여러 번 여는 것을 막는 스캔 내 메모. 키는 메타 폴더 경로.
+        # 같은 컷을 scan_shots(ANI)와 scan_lighting(LGT)이 각각 훑던 왕복도 여기서 합쳐진다.
+        self._meta_index_cache = {}
+        self._assignment_cache = {}
 
     def clear_cache(self):
         """스캔 캐시를 모두 비운다 — 새로고침 전에 호출해 실측을 강제한다.
@@ -100,6 +103,8 @@ class ProjectScanner:
         self.cached_assets = None
         self.cached_shots = None
         self.cached_lighting = None
+        self._meta_index_cache.clear()
+        self._assignment_cache.clear()
 
     def check_status(self, task_base_path):
         return self.check_status_ver(task_base_path)[0]
@@ -140,9 +145,47 @@ class ProjectScanner:
 
     def _read_assignment(self, meta_dir):
         """폴더의 assignment.json(PD가 지정한 단계별 담당자)을 읽어 dict 반환.
-        없거나 읽기 실패 시 빈 dict. 본 파일이 깨져 있으면 직전 백업을 쓴다."""
-        from common_utils import load_json
-        return load_json(os.path.join(meta_dir, "assignment.json"))
+        없거나 읽기 실패 시 빈 dict. 본 파일이 깨져 있으면 직전 백업을 쓴다.
+
+        한 번 읽은 폴더는 `clear_cache()` 전까지 다시 열지 않는다 — 같은 컷의
+        assignment.json을 작업자·해당없음 판정이 각각 열어 컷당 2~3회 반복됐다.
+        캐시 수명은 cached_assets/cached_shots 와 같다(새로고침마다 비워진다)."""
+        if meta_dir not in self._assignment_cache:
+            from common_utils import load_json
+            self._assignment_cache[meta_dir] = load_json(
+                os.path.join(meta_dir, "assignment.json"))
+        return self._assignment_cache[meta_dir]
+
+    def _meta_index(self, meta_dir):
+        """메타 폴더의 버전 기록 JSON 색인 {파일이름: 전체경로}. 폴더당 1회만 훑는다.
+
+        `iter_version_metas` 는 한 번 부를 때마다 메타 폴더 → `{STAGE}` →
+        `{wip|pub}` 을 새로 조회한다(폴더당 3~4 왕복). 단계별로 따로 부르면
+        그만큼 배가 되므로, **모든 단계를 한 번에** 받아 두고 단계 필터는
+        메모리에서 건다. 같은 이름이 두 자리에 있으면 새 구조 쪽이 남는다.
+        캐시 수명은 `_read_assignment` 와 같다."""
+        if meta_dir not in self._meta_index_cache:
+            self._meta_index_cache[meta_dir] = dict(iter_version_metas(meta_dir))
+        return self._meta_index_cache[meta_dir]
+
+    def _latest_meta(self, meta_dir, stage=None):
+        """색인에서 **가장 최근에 저장된** 버전 기록 JSON의 전체 경로. 없으면 None.
+
+        `common_utils.latest_version_meta` 와 판정 규칙(mtime 최대)이 같지만
+        폴더를 다시 훑지 않고 `_meta_index` 를 쓴다. mtime 조회는 파일마다
+        개별로 감싼다 — 색인을 만든 뒤 조회하기까지의 사이에 파일이 사라질 수
+        있고(임시 파일·동기화 중인 클라우드 폴더), 예외가 나면 스캔 전체가 무효가 된다."""
+        latest_path, latest_mtime = None, -1.0
+        for name, path in self._meta_index(meta_dir).items():
+            if not is_version_meta(name, stage):
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if mtime > latest_mtime:
+                latest_path, latest_mtime = path, mtime
+        return latest_path
 
     def scan_asset_meta(self, meta_dir):
         """에셋 메타 폴더를 '한 번만' 훑어 필요한 값을 모두 뽑아 반환한다.
@@ -178,7 +221,7 @@ class ProjectScanner:
         # (임시 파일은 이름이 tmp… 라 정렬에서 마지막에 와, 대표값 폴백을 가로챈다)
         # iter_version_metas 가 새 구조(`{STAGE}/{wip|pub}/`)와 옛 평면 구조를 함께
         # 훑는다. 같은 이름이 두 자리에 있으면 새 구조 쪽이 남는다.
-        meta_paths = dict(iter_version_metas(meta_dir))     # 파일이름 → 전체경로
+        meta_paths = self._meta_index(meta_dir)             # 파일이름 → 전체경로
         json_files = sorted(meta_paths)
 
         # 열어본 파일 캐시 (같은 파일 중복 오픈 방지)
@@ -264,8 +307,8 @@ class ProjectScanner:
         stage 가 None 이면 assignment.json 의 아무 값이나(대표), 그것도 없으면
         폴더의 모든 JSON 중 최신 파일의 user 를 본다.
 
-        (성능이 중요한 스캔 루프에서는 scan_asset_meta 를 쓰고, 이 메서드는
-         다른 탭이 단건으로 물을 때를 위해 유지한다.)
+        폴더 조회는 `_meta_index` 가 폴더당 1회로 묶으므로 스캔 루프에서 불러도
+        된다(에셋은 값을 한꺼번에 뽑는 scan_asset_meta 쪽이 여전히 낫다).
         """
         # 폴더 존재 여부는 따로 묻지 않는다 — 폴더가 없으면 assignment.json도
         # 있을 수 없고, 아래 목록도 비어 "-"로 끝난다(기존 결과와 동일).
@@ -284,11 +327,12 @@ class ProjectScanner:
                     return override.strip()
 
         # 2) 버전 파일 fallback (새 구조·옛 평면 구조 모두)
-        metas = iter_version_metas(meta_dir, stage)
-        if not metas: return "-"
-        metas.sort()  # zero-pad된 _v### 덕분에 파일명 정렬 = 버전 순
-        name, path = metas[-1]
-        return self._read_user_field(path, name)
+        index = self._meta_index(meta_dir)
+        names = sorted(n for n in index if is_version_meta(n, stage))
+        if not names: return "-"
+        # zero-pad된 _v### 덕분에 파일명 정렬 = 버전 순
+        name = names[-1]
+        return self._read_user_field(index[name], name)
 
     def get_all_member_names(self):
         """project_config.json의 teams(구버전은 members)에서 모든 팀원 이름을 모아
@@ -323,7 +367,7 @@ class ProjectScanner:
     def get_deadline_from_metadata(self, meta_dir):
         """JSON 메타데이터에서 개별 마감일(주로 에셋)을 읽어오는 메서드"""
         if not os.path.exists(meta_dir): return ""
-        latest_json = latest_version_meta(meta_dir)
+        latest_json = self._latest_meta(meta_dir)
         if not latest_json: return ""
         try:
             with open(latest_json, 'r', encoding='utf-8') as f:
@@ -388,7 +432,7 @@ class ProjectScanner:
         meta_dir = os.path.join(self.project_path, "_metadata", "shots", scene, cut)
         # 상태(status)는 버전 기록 JSON에만 있다. 같은 폴더의 assignment.json이나
         # 저장 중 잠깐 생기는 임시 파일이 "최신"으로 뽑히면 세부 상태가 사라진다.
-        latest_json = latest_version_meta(meta_dir, stage="ANI")
+        latest_json = self._latest_meta(meta_dir, stage="ANI")
         if not latest_json: return actual_status
         try:
             with open(latest_json, 'r', encoding='utf-8') as f:

@@ -1,32 +1,36 @@
-"""HB CREW 화면 — 내 작업 목록(읽기 전용).
+"""HB CREW 창(셸) — 설정·프로젝트·스캔을 맡고 화면 둘을 갈아 끼운다.
 
 진입점은 crew_main.py 이고, 이 모듈은 창(CrewWindow)과 그에 딸린 로직만 갖는다.
 **반대 방향(여기서 crew_main 을 import)은 하지 않는다** — 런처가 crew_main 을
 "__main__" 으로 실행하기 때문에, 역방향 import 는 같은 파일을 두 번 로드해
 설정/로깅이 이중으로 초기화된다.
 
+화면은 각자 파일에 있다. import 는 한 방향으로만 흐른다:
+    crew_main → crew_ui → (crew_home, crew_tasks, crew_recent)
+                        → (common_utils, scanner_core)
+화면에서 창으로 올라오는 요청은 import 가 아니라 **시그널**로 전달된다.
+
 이 프로그램이 프로젝트 폴더에 쓰는 것은 **아무것도 없다.**
-기억하는 것은 사용자 설정(crew_settings.json: 마지막 프로젝트, 내 이름)뿐이다.
+기억하는 것은 사용자 설정(crew_settings.json: 마지막 프로젝트, 내 이름, 직전 인사)뿐이다.
 배정과 마감을 바꾸는 일은 PD 대시보드의 몫이다.
 """
 import os
 import json
 
-from PySide6 import QtWidgets, QtCore, QtGui
+from PySide6 import QtWidgets, QtCore
 
-from common_utils import safe_json_save, logger, user_config_path, status_label
+from common_utils import safe_json_save, logger, user_config_path
 from scanner_core import ProjectScanner
+from crew_home import HomeView, pick_greeting
+from crew_tasks import TaskView, collect_my_tasks, progress_summary, STAGE_LABELS
+from crew_recent import find_recent_work, describe
 
 # CREW 는 처음부터 사용자 프로필 아래에 쓴다(이관해 올 옛 파일이 없다).
 SETTINGS_FILE = user_config_path("crew", "crew_settings.json")
 
 CONFIG_REL = os.path.join("_pipeline", "project_config.json")
 
-# 배정을 읽어올 단계. 에셋은 단계별 작업자 키가 따로 있고,
-# 샷(ANI)/라이팅(LGT)은 스캔 결과의 "Worker" 하나뿐이다.
-ASSET_STAGES = ("MDL", "RIG", "TEX")
-
-NAME_PLACEHOLDER = "- 이름 선택 -"
+PAGE_HOME, PAGE_TASKS = 0, 1
 
 
 # ── 설정 ────────────────────────────────────────────────────────
@@ -56,97 +60,84 @@ def is_valid_project(path):
     return bool(path) and os.path.exists(os.path.join(path, CONFIG_REL))
 
 
-def read_project_name(path):
-    """표시용 프로젝트 이름. 설정에 이름이 없으면 폴더명을 쓴다."""
+def _read_config(path):
     try:
         with open(os.path.join(path, CONFIG_REL), 'r', encoding='utf-8') as f:
-            name = json.load(f).get("project_name", "").strip()
-            if name:
-                return name
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     except Exception:
-        pass
+        return {}
+
+
+def read_project_name(path):
+    """표시용 프로젝트 이름. 설정에 이름이 없으면 폴더명을 쓴다."""
+    name = _read_config(path).get("project_name", "").strip() if path else ""
+    if name:
+        return name
     return os.path.basename(os.path.normpath(path)) if path else ""
 
 
-# ── 필터 (순수 함수 — Qt 없이 동작) ─────────────────────────────
-def collect_my_tasks(assets, shots, lighting, my_name):
-    """스캔 결과에서 **내 이름이 배정된 작업만** 골라 표에 넣을 행 목록으로 만든다.
+def read_member_profile(path, name):
+    """project_config.json 에서 이 사람의 파트·소속을 모은다. 없으면 None.
 
-    이름 비교는 앞뒤 공백만 떼고 **정확히 일치(==)** 시킨다.
-    부분 일치를 쓰면 '김민'이 '김민수'의 작업까지 가져가고,
-    상태 판정에서 같은 실수로 났던 오탐과 원인이 같아진다.
+    한 사람이 여러 팀/세부팀에 들어가 있는 경우가 흔하다(예: 관리팀 + PRE).
+    그래서 파트는 **모든 소속의 합집합**으로 모으고, 소속은 "팀 › 세부팀"으로 적는다.
+    이름 비교는 앞뒤 공백만 떼고 **정확히 일치(==)** — 부분 일치를 쓰면
+    '김민'이 '김민수'의 소속을 가져간다(작업 필터와 같은 규칙).
 
-    반환: [{kind, group, name, stage, status, deadline, done, detail}, ...]
-      kind   : "에셋" | "샷"
-      group  : 에셋은 카테고리(Character/Env/Prop), 샷은 시퀀스명
-      stage  : MDL/RIG/TEX/ANI/LGT
-      detail : 부가 설명(툴팁용). 없으면 ""
+    이 파일은 hb_pd 와 공유하는 scanner_core 가 아니라 여기서 읽는다.
+    scanner_core 는 원본이 hb_pd 에 있는 사본이라, CREW 전용 기능을 넣으면
+    동기화할 때 지워진다.
     """
-    rows = []
-    me = (my_name or "").strip()
-    if not me:
-        return rows
+    me = (name or "").strip()
+    if not (path and me):
+        return None
 
-    def mine(value):
-        return (value or "").strip() == me
+    data = _read_config(path)
+    teams = data.get("teams", [])
+    if not teams and "members" in data:
+        teams = [{"members": data.get("members", [])}]
 
-    # 에셋 — 단계별 담당자가 따로 있다(assignment.json 우선, 없으면 최신 버전 JSON)
-    for asset_name in sorted(assets):
-        info = assets[asset_name]
-        for stage in ASSET_STAGES:
-            if not mine(info.get(f"Worker_{stage}")):
+    found = False
+    main_part, sub_part, where, subteams = [], [], [], []
+
+    def add(dst, value):
+        value = (value or "").strip()
+        if value and value not in dst:
+            dst.append(value)
+
+    def collect(members, label, subteam_name=None):
+        nonlocal found
+        for m in members or []:
+            if not isinstance(m, dict) or (m.get("name", "") or "").strip() != me:
                 continue
-            rows.append({
-                "kind": "에셋",
-                "group": info.get("Category", ""),
-                "name": asset_name,
-                "stage": stage,
-                "status": info.get(stage, "Not Started"),
-                "ver": info.get(f"{stage}_Ver", ""),
-                "deadline": info.get(f"Deadline_{stage}", "") or info.get("Deadline", ""),
-                "done": bool(info.get(f"DeadlineDone_{stage}", info.get("DeadlineDone", False))),
-                "detail": "",
-            })
+            found = True
+            for p in (m.get("main_part") or []):
+                add(main_part, p)
+            for p in (m.get("sub_part") or []):
+                add(sub_part, p)
+            add(where, label)
+            add(subteams, subteam_name)
 
-    # 샷 애니메이션 — 키는 "{SC} / {C}", 마감은 씬 단위
-    for shot_key in sorted(shots):
-        info = shots[shot_key]
-        if not mine(info.get("Worker")):
+    for team in teams:
+        if not isinstance(team, dict):
             continue
-        seq = shot_key.split("/")[0].strip()
-        rows.append({
-            "kind": "샷",
-            "group": seq,
-            "name": shot_key,
-            "stage": "ANI",
-            "status": info.get("DetailedStatus") or info.get("ani", "Not Started"),
-            "ver": info.get("ani_Ver", ""),
-            "deadline": info.get("Deadline", ""),
-            "done": bool(info.get("DeadlineDone", False)),
-            "detail": "",
-        })
+        team_name = (team.get("team_name", "") or "").strip()
+        collect(team.get("members", []), team_name)
+        for subteam in team.get("subteams", []) or []:
+            if not isinstance(subteam, dict):
+                continue
+            sub_name = (subteam.get("subteam_name", "") or "").strip()
+            collect(subteam.get("members", []),
+                    f"{team_name} › {sub_name}" if team_name and sub_name else (sub_name or team_name),
+                    sub_name)
 
-    # 라이팅 — 마야/블렌더를 따로 판정하므로 세부는 툴팁으로 남긴다
-    for shot_key in sorted(lighting):
-        info = lighting[shot_key]
-        if not mine(info.get("Worker")):
-            continue
-        seq = shot_key.split("/")[0].strip()
-        rows.append({
-            "kind": "샷",
-            "group": seq,
-            "name": shot_key,
-            "stage": "LGT",
-            "status": info.get("DetailedStatus", "Not Started"),
-            "ver": info.get("Ver", ""),
-            "deadline": info.get("Deadline", ""),
-            "done": bool(info.get("DeadlineDone", False)),
-            "detail": "마야 {} / 블렌더 {}".format(
-                status_label(info.get("Maya", ""), info.get("Maya_Ver", "")),
-                status_label(info.get("Blender", ""), info.get("Blender_Ver", ""))),
-        })
-
-    return rows
+    if not found:
+        return None
+    # subteams 는 파트가 비었을 때의 대안이다 — PJB처럼 세부팀 이름이
+    # 사실상 파트인 프로젝트('캐릭터 모델링', '텍스처')가 많다.
+    return {"main_part": main_part, "sub_part": sub_part,
+            "teams": where, "subteams": subteams}
 
 
 # ── 스캔 스레드 ─────────────────────────────────────────────────
@@ -166,9 +157,7 @@ class CrewScannerThread(QtCore.QThread):
     def run(self):
         try:
             s = self.scanner
-            s.cached_assets = None
-            s.cached_shots = None
-            s.cached_lighting = None
+            s.clear_cache()   # 비우는 책임은 스캐너에 있다(캐시가 늘어도 빠뜨리지 않게)
             assets = s.scan_assets()
             shots = s.scan_shots()
             lighting = s.scan_lighting()
@@ -178,20 +167,51 @@ class CrewScannerThread(QtCore.QThread):
             self.data_ready.emit({}, {}, {})
 
 
+class CrewRecentThread(QtCore.QThread):
+    """'이어서 하기' 찾기도 백그라운드에서 한다.
+
+    내 작업마다 메타 폴더를 한 번씩 열어 보므로(PJB 116건 기준 0.5초, 클라우드
+    드라이브에서는 더 걸린다) UI 스레드에서 돌리면 창이 그만큼 멈춘다.
+    목록은 스캔이 끝나는 즉시 나오고, 카드는 뒤늦게 채워진다.
+
+    결과에 **이름을 실어 보낸다.** 조회 중에 사용자가 이름을 바꿀 수 있고,
+    그때 늦게 도착한 결과를 그대로 그리면 남의 작업이 내 카드에 뜬다.
+    """
+    found = QtCore.Signal(str, object)
+
+    def __init__(self, project_path, rows, my_name):
+        super().__init__()
+        self.project_path = project_path
+        self.rows = rows
+        self.my_name = my_name
+
+    def run(self):
+        try:
+            recent = find_recent_work(self.project_path, self.rows, self.my_name)
+        except Exception as e:
+            logger.error(f"이어서 하기 조회 실패: {e}")
+            recent = None
+        self.found.emit(self.my_name, recent)
+
+
 # ── 창 ──────────────────────────────────────────────────────────
 class CrewWindow(QtWidgets.QWidget):
-    COLUMNS = ["구분", "이름", "단계", "상태", "마감"]
 
     def __init__(self, project_path=None):
         super().__init__()
+        settings = load_settings()
         self.project_path = project_path if is_valid_project(project_path) else None
         self.scanner = None
         self.thread = None
+        self.recent_thread = None
         self._refresh_pending = False
+        self._recent_pending = False
+        self._recent_name = None   # 지금 카드에 떠 있는 사람
+        self._scanned = False
         self.assets = {}
         self.shots = {}
         self.lighting = {}
-        self.my_name = (load_settings().get("my_name") or "").strip()
+        self.my_name = (settings.get("my_name") or "").strip()
 
         self.setMinimumSize(760, 520)
         self.resize(920, 640)
@@ -199,79 +219,63 @@ class CrewWindow(QtWidgets.QWidget):
         self.apply_styles()
         self.update_title()
 
+        # 인사는 **실행할 때 한 번** 고른다(화면을 오갈 때마다 바뀌면 산만하다).
+        greeting = pick_greeting(settings.get("last_greeting"))
+        self.home.set_greeting_template(greeting)
+        save_settings(last_greeting=greeting)
+
         if self.project_path:
             self.load_project(self.project_path)
         else:
-            self.status_label.setText("프로젝트를 선택하세요.")
+            self.refresh_home()
 
     # --- UI 구성 ---
     def init_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        top = QtWidgets.QHBoxLayout()
-        top.setSpacing(8)
+        self.stack = QtWidgets.QStackedWidget()
+        self.home = HomeView()
+        self.tasks = TaskView()
+        self.stack.addWidget(self.home)     # PAGE_HOME
+        self.stack.addWidget(self.tasks)    # PAGE_TASKS
+        layout.addWidget(self.stack)
 
-        self.project_label = QtWidgets.QLabel("프로젝트 없음")
-        self.project_label.setObjectName("ProjectLabel")
-        top.addWidget(self.project_label)
-
-        self.btn_open = QtWidgets.QPushButton("프로젝트 열기")
-        self.btn_open.clicked.connect(self.choose_project)
-        top.addWidget(self.btn_open)
-
-        top.addSpacing(12)
-        top.addWidget(QtWidgets.QLabel("내 이름"))
-        self.name_combo = QtWidgets.QComboBox()
-        self.name_combo.setMinimumWidth(150)
-        self.name_combo.addItem(NAME_PLACEHOLDER)
-        self.name_combo.currentIndexChanged.connect(self.on_name_changed)
-        top.addWidget(self.name_combo)
-
-        self.btn_refresh = QtWidgets.QPushButton("새로고침")
-        self.btn_refresh.setObjectName("PrimaryButton")
-        self.btn_refresh.clicked.connect(self.refresh)
-        top.addWidget(self.btn_refresh)
-
-        top.addStretch()
-        self.status_label = QtWidgets.QLabel("")
-        self.status_label.setObjectName("StatusLabel")
-        top.addWidget(self.status_label)
-        layout.addLayout(top)
-
-        self.tree = QtWidgets.QTreeWidget()
-        self.tree.setColumnCount(len(self.COLUMNS))
-        self.tree.setHeaderLabels(self.COLUMNS)
-        self.tree.setRootIsDecorated(False)
-        self.tree.setAlternatingRowColors(True)
-        self.tree.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        header = self.tree.header()
-        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
-        layout.addWidget(self.tree, 1)
-
-        self.footer_label = QtWidgets.QLabel(
-            "읽기 전용 — 배정과 마감은 PD가 관리합니다.")
-        self.footer_label.setObjectName("FooterLabel")
-        layout.addWidget(self.footer_label)
+        self.home.open_project_requested.connect(self.choose_project)
+        self.home.name_changed.connect(self.on_name_changed)
+        self.home.open_tasks.connect(self.show_tasks)
+        self.tasks.go_home.connect(self.show_home)
+        self.tasks.refresh_requested.connect(self.refresh)
 
     def apply_styles(self):
         self.setStyleSheet("""
             QWidget { background-color: #1a1a1e; color: #e8e8ec;
                       font-family: 'Segoe UI', 'Malgun Gothic'; font-size: 10pt; }
+            /* 라벨 배경은 비워 둔다 — 위의 QWidget 배경이 카드 위에도 칠해져
+               카드가 얼룩덜룩해진다. */
+            QLabel { background-color: transparent; }
             QLabel#ProjectLabel { font-size: 12pt; font-weight: bold; color: #ffffff; }
+            QLabel#ViewTitle { font-size: 12pt; font-weight: bold; color: #ffffff; }
+            QLabel#Greeting { font-size: 20pt; font-weight: bold; color: #ffffff; }
             QLabel#StatusLabel { color: #8b8b94; }
             QLabel#FooterLabel { color: #6f6f78; font-size: 9pt; }
+            QLabel#RecentCaption { color: #818cf8; font-size: 9pt; font-weight: bold; }
+            QLabel#RecentTitle { color: #ffffff; font-size: 13pt; font-weight: bold; }
+            QLabel#RecentMemo { color: #b8b8c2; font-size: 9pt; }
+            QLabel#RecentThumb { background-color: #101013; border: 1px solid #2f2f38;
+                          border-radius: 4px; color: #4f4f58; font-size: 8pt; }
+            QFrame#RecentCard { background-color: #202027; border: 1px solid #3a3a52;
+                          border-radius: 8px; }
             QPushButton { background-color: #2a2a30; color: #d4d4dc; border: 1px solid #3a3a42;
                           border-radius: 4px; padding: 6px 12px; }
             QPushButton:hover { background-color: #3a3a40; }
             QPushButton#PrimaryButton { background-color: #6366f1; color: #ffffff;
                           border: none; font-weight: bold; }
             QPushButton#PrimaryButton:hover { background-color: #818cf8; }
+            QPushButton#BigButton { background-color: #6366f1; color: #ffffff; border: none;
+                          border-radius: 6px; font-size: 13pt; font-weight: bold; }
+            QPushButton#BigButton:hover { background-color: #818cf8; }
+            QPushButton#BigButton:disabled { background-color: #2a2a30; color: #6f6f78; }
             QComboBox { background-color: #242429; color: #e8e8ec; border: 1px solid #3a3a42;
                         border-radius: 4px; padding: 4px 8px; }
             QComboBox:hover { border: 1px solid #6366f1; }
@@ -287,6 +291,17 @@ class CrewWindow(QtWidgets.QWidget):
 
     def update_title(self):
         self.setWindowTitle(f"HB CREW | {self.my_name}" if self.my_name else "HB CREW")
+
+    # --- 화면 이동 ---
+    def show_home(self):
+        self.stack.setCurrentIndex(PAGE_HOME)
+
+    def show_tasks(self):
+        if not (self.scanner and self.my_name):
+            return
+        self.stack.setCurrentIndex(PAGE_TASKS)
+        if not self._scanned:
+            self.refresh()   # 스캔 전에 들어왔으면(빠른 클릭) 여기서 시작한다
 
     # --- 프로젝트 ---
     def choose_project(self):
@@ -307,36 +322,38 @@ class CrewWindow(QtWidgets.QWidget):
     def load_project(self, path):
         self.project_path = path
         self.scanner = ProjectScanner(path)
-        self.project_label.setText(read_project_name(path))
-        self.project_label.setToolTip(path)
-        self.reload_member_names()
+        self._scanned = False
+        self.home.set_project(read_project_name(path), path)
+        self.home.set_names(self.scanner.get_all_member_names(), self.my_name)
+        self.refresh_home()
         self.refresh()
 
-    def reload_member_names(self):
-        """팀원 명단(project_config.json)으로 이름 콤보를 다시 채운다.
-        저장해 둔 내 이름이 명단에 없어도(외주·이름 변경 등) 항목으로 남겨 유지한다."""
-        names = self.scanner.get_all_member_names() if self.scanner else []
-        self.name_combo.blockSignals(True)
-        self.name_combo.clear()
-        self.name_combo.addItem(NAME_PLACEHOLDER)
-        for nm in names:
-            self.name_combo.addItem(nm)
-        if self.my_name:
-            idx = self.name_combo.findText(self.my_name)
-            if idx < 0:
-                self.name_combo.addItem(self.my_name)
-                idx = self.name_combo.findText(self.my_name)
-            self.name_combo.setCurrentIndex(idx)
-        self.name_combo.blockSignals(False)
-
-    def on_name_changed(self, _idx):
-        text = self.name_combo.currentText()
-        self.my_name = "" if text == NAME_PLACEHOLDER else text.strip()
+    def on_name_changed(self, name):
+        self.my_name = name
         save_settings(my_name=self.my_name)
         self.update_title()
+        self.refresh_home()
         self.populate()
 
+    def refresh_home(self):
+        """홈의 인사·파트·소속과 작업 건수를 현재 상태로 맞춘다."""
+        profile = read_member_profile(self.project_path, self.my_name)
+        self.home.set_profile(self.my_name, profile, bool(self.scanner))
+        self.home.set_summary(self.summary_text())
+
+    def summary_text(self):
+        if not self.scanner:
+            return ""
+        if not self.my_name:
+            return ""
+        if not self._scanned:
+            return "작업을 불러오는 중…"
+        return progress_summary(self.current_rows())
+
     # --- 스캔 ---
+    def current_rows(self):
+        return collect_my_tasks(self.assets, self.shots, self.lighting, self.my_name)
+
     def refresh(self):
         if not self.scanner:
             return
@@ -344,15 +361,17 @@ class CrewWindow(QtWidgets.QWidget):
             # 실행 중인 QThread 를 다시 띄우거나 파괴하면 크래시가 난다. 끝난 뒤로 미룬다.
             self._refresh_pending = True
             return
-        self.btn_refresh.setEnabled(False)
-        self.status_label.setText("스캔 중…")
+        self.tasks.set_busy(True)
+        self.tasks.set_status("스캔 중…")
+        self.home.set_summary("작업을 불러오는 중…" if self.my_name else "")
         self.thread = CrewScannerThread(self.scanner)
         self.thread.data_ready.connect(self.on_scan_complete)
         self.thread.start()
 
     def on_scan_complete(self, assets, shots, lighting):
         self.assets, self.shots, self.lighting = assets, shots, lighting
-        self.btn_refresh.setEnabled(True)
+        self._scanned = True
+        self.tasks.set_busy(False)
         self.populate()
         if self._refresh_pending:
             self._refresh_pending = False
@@ -360,36 +379,55 @@ class CrewWindow(QtWidgets.QWidget):
 
     # --- 표시 ---
     def populate(self):
-        self.tree.clear()
         if not self.scanner:
-            self.status_label.setText("프로젝트를 선택하세요.")
+            self.tasks.clear()
+            self.tasks.set_status("프로젝트를 선택하세요.")
+            self.home.set_summary("")
+            self.home.set_recent("", "", "", "")
             return
         if not self.my_name:
-            self.status_label.setText("이름을 선택하세요.")
+            self.tasks.clear()
+            self.tasks.set_status("이름을 선택하세요.")
+            self.home.set_summary("")
+            self.home.set_recent("", "", "", "")
             return
 
-        rows = collect_my_tasks(self.assets, self.shots, self.lighting, self.my_name)
-        for row in rows:
-            item = QtWidgets.QTreeWidgetItem([
-                row["kind"],
-                row["name"],
-                row["stage"],
-                # 표시는 PUB(v003)/WIP(v012). 필터·정렬은 row["status"] 토큰으로 한다.
-                status_label(row["status"], row.get("ver", "")),
-                row["deadline"] or "-",
-            ])
-            tip = row["group"]
-            if row["detail"]:
-                tip = f"{tip} · {row['detail']}" if tip else row["detail"]
-            if tip:
-                for col in range(len(self.COLUMNS)):
-                    item.setToolTip(col, tip)
-            self.tree.addTopLevelItem(item)
+        rows = self.current_rows()
+        self.tasks.show_rows(rows)
+        self.tasks.set_status(progress_summary(rows))
+        self.home.set_summary(self.summary_text())
+        self.find_recent(rows)
 
-        self.status_label.setText(f"내 작업 {len(rows)}건")
+    # --- 이어서 하기 ---
+    def find_recent(self, rows):
+        """내가 마지막으로 저장한 작업을 백그라운드로 찾는다."""
+        if not (self.project_path and self.my_name):
+            return
+        if self._recent_name != self.my_name:
+            # 이름이 바뀐 참이다. 새 결과가 올 때까지 앞사람 카드를 남겨 두면 안 된다.
+            self.home.set_recent("", "", "", "")
+            self._recent_name = self.my_name
+        if self.recent_thread and self.recent_thread.isRunning():
+            # 실행 중인 QThread 를 다시 띄우면 크래시가 난다(스캔과 같은 규칙).
+            self._recent_pending = True
+            return
+        self.recent_thread = CrewRecentThread(self.project_path, rows, self.my_name)
+        self.recent_thread.found.connect(self.on_recent_found)
+        self.recent_thread.start()
+
+    def on_recent_found(self, name, recent):
+        if name != self.my_name:
+            return   # 조회 중에 이름이 바뀌었다 — 늦게 온 남의 결과는 버린다
+        title, subtitle, memo = describe(recent, STAGE_LABELS)
+        self.home.set_recent(title, subtitle, memo,
+                             recent["thumb"] if recent else "")
+        if self._recent_pending:
+            self._recent_pending = False
+            self.find_recent(self.current_rows())
 
     # --- 종료 ---
     def closeEvent(self, event):
-        if self.thread and self.thread.isRunning():
-            self.thread.wait(3000)
+        for thread in (self.thread, self.recent_thread):
+            if thread and thread.isRunning():
+                thread.wait(3000)
         super().closeEvent(event)
